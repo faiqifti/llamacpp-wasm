@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Upload, Play, Loader2, FileText, Send, Trash2, User, Bot, Download, Save, Plus, MessageSquare, Menu, X } from 'lucide-react';
+import { Upload, Play, Loader2, FileText, Send, Trash2, User, Bot, Download, Save, Plus, MessageSquare, Menu, X, Globe, HardDrive } from 'lucide-react';
 
 interface ProgressCallback {
   loaded: number;
@@ -19,6 +19,7 @@ interface WllamaConfig {
 }
 
 interface Wllama {
+  loadModelFromUrl: (url: string, config: WllamaConfig) => Promise<void>;
   loadModel: (blobs: File[], config: WllamaConfig) => Promise<void>;
   createCompletion: (prompt: string, options: any) => Promise<string>;
 }
@@ -37,8 +38,13 @@ interface Conversation {
   updatedAt: Date;
 }
 
+interface CachedModel {
+  url: string;
+  size: number;
+  name: string;
+}
+
 export default function WllamaUI() {
-  const [modelFile, setModelFile] = useState<FileList | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [loadProgress, setLoadProgress] = useState(0);
   const [input, setInput] = useState('');
@@ -49,6 +55,15 @@ export default function WllamaUI() {
   const [nCtx, setNCtx] = useState(4096);
   const [isGenerating, setIsGenerating] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [showModelManager, setShowModelManager] = useState(false);
+  const [modelUrl, setModelUrl] = useState('');
+  const [cachedModels, setCachedModels] = useState<CachedModel[]>([]);
+  const [loadMethod, setLoadMethod] = useState<'url' | 'file'>('url');
+  const [modelFile, setModelFile] = useState<FileList | null>(null);
+  const [availableFiles, setAvailableFiles] = useState<string[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string>('');
+  const [fetchingFiles, setFetchingFiles] = useState(false);
+  const [chatTemplate, setChatTemplate] = useState<'gemma' | 'qwen' | 'llama' | 'chatml'>('gemma');
   const wllamaRef = useRef<Wllama | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -71,7 +86,6 @@ export default function WllamaUI() {
         }));
         setConversations(conversationsWithDates);
         
-        // Load last active conversation
         const lastActiveId = localStorage.getItem('wllama-last-conversation-id');
         if (lastActiveId && conversationsWithDates.find((c: Conversation) => c.id === lastActiveId)) {
           setCurrentConversationId(lastActiveId);
@@ -82,16 +96,15 @@ export default function WllamaUI() {
         console.error('Failed to load conversations:', err);
       }
     }
+    loadCachedModels();
   }, []);
 
-  // Save conversations to localStorage whenever they change
   useEffect(() => {
     if (conversations.length > 0) {
       localStorage.setItem('wllama-conversations', JSON.stringify(conversations));
     }
   }, [conversations]);
 
-  // Save current conversation ID
   useEffect(() => {
     if (currentConversationId) {
       localStorage.setItem('wllama-last-conversation-id', currentConversationId);
@@ -108,6 +121,68 @@ export default function WllamaUI() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  const loadCachedModels = async () => {
+    try {
+      const WllamaModule = await import('@wllama/wllama/esm/index.js');
+      const { ModelManager } = WllamaModule;
+      const manager = new ModelManager();
+      const models = await manager.getModels();
+      setCachedModels(models.map((m: any) => ({
+        url: m.url,
+        size: m.size,
+        name: m.url.split('/').pop()?.replace('.gguf', '') || 'Unknown'
+      })));
+    } catch (err) {
+      console.error('Failed to load cached models:', err);
+    }
+  };
+
+  const fetchRepoFiles = async (repoId: string) => {
+    setFetchingFiles(true);
+    setAvailableFiles([]);
+    setSelectedFile('');
+    setError('');
+    
+    try {
+      // Fetch file list from Hugging Face API
+      const response = await fetch(`https://huggingface.co/api/models/${repoId}/tree/main`);
+      if (!response.ok) {
+        throw new Error('Repository not found or inaccessible');
+      }
+      
+      const data = await response.json();
+      const ggufFiles = data
+        .filter((item: any) => item.path.endsWith('.gguf'))
+        .map((item: any) => item.path);
+      
+      if (ggufFiles.length === 0) {
+        setError('No .gguf files found in this repository');
+      } else {
+        setAvailableFiles(ggufFiles);
+        if (ggufFiles.length === 1) {
+          setSelectedFile(ggufFiles[0]);
+        }
+      }
+    } catch (err: any) {
+      setError('Failed to fetch repository: ' + (err?.message || String(err)));
+    } finally {
+      setFetchingFiles(false);
+    }
+  };
+
+  const handleRepoInputChange = (value: string) => {
+    setModelUrl(value);
+    
+    // Auto-fetch files if input looks like a repo ID
+    const repoPattern = /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+$/;
+    if (repoPattern.test(value)) {
+      fetchRepoFiles(value);
+    } else {
+      setAvailableFiles([]);
+      setSelectedFile('');
+    }
+  };
 
   const createNewConversation = () => {
     const newConv: Conversation = {
@@ -148,7 +223,6 @@ export default function WllamaUI() {
       if (hasGguf) {
         setModelFile(files);
         setError('');
-        setStatus(`Model file(s) selected: ${files.length} file(s)`);
       } else {
         setError('Please select at least one valid .gguf model file');
         setModelFile(null);
@@ -156,7 +230,76 @@ export default function WllamaUI() {
     }
   };
 
-  const loadModel = async () => {
+  const loadModelFromUrl = async (url: string) => {
+    setIsLoading(true);
+    setError('');
+    setLoadProgress(0);
+    setStatus('Initializing Wllama...');
+
+    try {
+      // Construct full URL if needed
+      let fullUrl = url;
+      if (!url.startsWith('http')) {
+        // Assume it's a repo ID with a selected file
+        if (selectedFile) {
+          fullUrl = `https://huggingface.co/${modelUrl}/resolve/main/${selectedFile}`;
+        } else {
+          throw new Error('Please select a file from the repository');
+        }
+      }
+
+      const WllamaModule = await import('@wllama/wllama/esm/index.js');
+      const Wllama = WllamaModule.Wllama;
+      
+      const CONFIG_PATHS = {
+        'single-thread/wllama.wasm': './wllama/esm/single-thread/wllama.wasm',
+        'multi-thread/wllama.wasm': './wllama/esm/multi-thread/wllama.wasm',
+      };
+
+      wllamaRef.current = new Wllama(CONFIG_PATHS);
+
+      const progressCallback = ({ loaded, total }: ProgressCallback) => {
+        const progressPercentage = Math.round((loaded / total) * 100);
+        setLoadProgress(progressPercentage);
+        setStatus(`Loading model... ${progressPercentage}%`);
+      };
+
+      setStatus('Downloading model from URL...');
+      
+      const start = Date.now();
+      
+      const config: WllamaConfig = {
+        n_ctx: nCtx,
+        n_batch: 2048,
+        n_threads: navigator.hardwareConcurrency || 8, // Use all available CPU threads
+        n_gpu_layers: 0,
+        use_mlock: false,
+        use_mmap: true,
+        progressCallback,
+      };
+      
+      await wllamaRef.current.loadModelFromUrl(fullUrl, config);
+      
+      const took = Date.now() - start;
+      setStatus(`Model loaded successfully! (${took} ms)`);
+      setLoadProgress(100);
+      setShowModelManager(false);
+      
+      if (conversations.length === 0) {
+        createNewConversation();
+      }
+      
+      await loadCachedModels();
+    } catch (err: any) {
+      setError('Failed to load model: ' + (err?.message || String(err)));
+      setStatus('');
+      console.error(err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const loadModelFromFile = async () => {
     if (!modelFile) {
       setError('Please select a model file first');
       return;
@@ -204,8 +347,8 @@ export default function WllamaUI() {
       const took = Date.now() - start;
       setStatus(`Model loaded successfully! (${took} ms)`);
       setLoadProgress(100);
+      setShowModelManager(false);
       
-      // Create first conversation if none exists
       if (conversations.length === 0) {
         createNewConversation();
       }
@@ -218,18 +361,71 @@ export default function WllamaUI() {
     }
   };
 
+  const deleteCachedModel = async (url: string) => {
+    try {
+      const WllamaModule = await import('@wllama/wllama/esm/index.js');
+      const { ModelManager } = WllamaModule;
+      const manager = new ModelManager();
+      const models = await manager.getModels();
+      const model = models.find((m: any) => m.url === url);
+      if (model) {
+        await model.remove();
+        await loadCachedModels();
+        setStatus('Model deleted successfully');
+      }
+    } catch (err: any) {
+      setError('Failed to delete model: ' + (err?.message || String(err)));
+    }
+  };
+
   const buildConversationPrompt = (messages: Message[], newUserMessage: string) => {
     let prompt = '';
     
-    messages.forEach(msg => {
-      if (msg.role === 'user') {
-        prompt += `<start_of_turn>user\n${msg.content}<end_of_turn>\n`;
-      } else {
-        prompt += `<start_of_turn>model\n${msg.content}<end_of_turn>\n`;
-      }
-    });
-    
-    prompt += `<start_of_turn>user\n${newUserMessage}<end_of_turn>\n<start_of_turn>model\n`;
+    switch (chatTemplate) {
+      case 'gemma':
+        // Gemma format
+        messages.forEach(msg => {
+          if (msg.role === 'user') {
+            prompt += `<start_of_turn>user\n${msg.content}<end_of_turn>\n`;
+          } else {
+            prompt += `<start_of_turn>model\n${msg.content}<end_of_turn>\n`;
+          }
+        });
+        prompt += `<start_of_turn>user\n${newUserMessage}<end_of_turn>\n<start_of_turn>model\n`;
+        break;
+        
+      case 'qwen':
+        // Qwen format
+        messages.forEach(msg => {
+          if (msg.role === 'user') {
+            prompt += `<|im_start|>user\n${msg.content}<|im_end|>\n`;
+          } else {
+            prompt += `<|im_start|>assistant\n${msg.content}<|im_end|>\n`;
+          }
+        });
+        prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
+        break;
+        
+      case 'llama':
+        // Llama 2/3 format
+        messages.forEach(msg => {
+          if (msg.role === 'user') {
+            prompt += `[INST] ${msg.content} [/INST]\n`;
+          } else {
+            prompt += `${msg.content}\n`;
+          }
+        });
+        prompt += `[INST] ${newUserMessage} [/INST]\n`;
+        break;
+        
+      case 'chatml':
+        // ChatML format (used by many models)
+        messages.forEach(msg => {
+          prompt += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
+        });
+        prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
+        break;
+    }
     
     return prompt;
   };
@@ -244,7 +440,6 @@ export default function WllamaUI() {
       return;
     }
 
-    // Create new conversation if none exists
     if (!currentConversationId) {
       createNewConversation();
       return;
@@ -261,7 +456,7 @@ export default function WllamaUI() {
       timestamp: new Date()
     };
 
-    // Update conversation with user message
+    // Add user message first
     setConversations(prev => prev.map(conv => {
       if (conv.id === currentConversationId) {
         const updatedMessages = [...conv.messages, newUserMessage];
@@ -274,7 +469,6 @@ export default function WllamaUI() {
       return conv;
     }));
 
-    // Update title if this is the first message
     if (messages.length === 0) {
       updateConversationTitle(currentConversationId, userMessage);
     }
@@ -282,7 +476,30 @@ export default function WllamaUI() {
     try {
       const formattedPrompt = buildConversationPrompt(messages, userMessage);
 
-      const outputText = await wllamaRef.current.createCompletion(formattedPrompt, {
+      // Get the index for the assistant's message
+      const assistantMessageIndex = messages.length + 1; // +1 because we just added user message
+      
+      // Add placeholder for assistant response
+      setConversations(prev => prev.map(conv => {
+        if (conv.id === currentConversationId) {
+          return {
+            ...conv,
+            messages: [...conv.messages, {
+              role: 'assistant',
+              content: '',
+              timestamp: new Date()
+            }],
+            updatedAt: new Date()
+          };
+        }
+        return conv;
+      }));
+
+      let fullContent = '';
+      let displayContent = '';
+
+      // Use onNewToken callback for streaming
+      await wllamaRef.current!.createCompletion(formattedPrompt, {
         nPredict: 512,
         sampling: {
           temp: 0.7,
@@ -291,26 +508,62 @@ export default function WllamaUI() {
           repeat_penalty: 1.1,
           repeat_last_n: 64,
         },
+        onNewToken: (token: number, piece: Uint8Array, currentText: string) => {
+          fullContent = currentText;
+          
+          // Remove thinking blocks in real-time
+          displayContent = currentText
+            .replace(/<think>[\s\S]*?<\/think>/gi, '')
+            .replace(/<think>[\s\S]*$/gi, '') // Handle incomplete think blocks
+            .replace(/<end_of_turn>/g, '')
+            .replace(/<\|im_end\|>/g, '')
+            .replace(/\[INST\]/g, '')
+            .replace(/\[\/INST\]/g, '')
+            .trim();
+
+          // Update the message in real-time
+          setConversations(prev => prev.map(conv => {
+            if (conv.id === currentConversationId) {
+              const updated = [...conv.messages];
+              if (updated[assistantMessageIndex]) {
+                updated[assistantMessageIndex] = {
+                  role: 'assistant',
+                  content: displayContent,
+                  timestamp: new Date()
+                };
+              }
+              return { ...conv, messages: updated, updatedAt: new Date() };
+            }
+            return conv;
+          }));
+        }
       });
 
-      const cleanOutput = outputText.replace(/<end_of_turn>/g, '').trim();
+      // Final cleanup
+      const finalContent = fullContent
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/<end_of_turn>/g, '')
+        .replace(/<\|im_end\|>/g, '')
+        .replace(/\[INST\]/g, '')
+        .replace(/\[\/INST\]/g, '')
+        .trim();
 
-      const assistantMessage: Message = {
-        role: 'assistant',
-        content: cleanOutput,
-        timestamp: new Date()
-      };
-
+      // Update with final cleaned content
       setConversations(prev => prev.map(conv => {
         if (conv.id === currentConversationId) {
-          return {
-            ...conv,
-            messages: [...conv.messages, assistantMessage],
-            updatedAt: new Date()
-          };
+          const updated = [...conv.messages];
+          if (updated[assistantMessageIndex]) {
+            updated[assistantMessageIndex] = {
+              role: 'assistant',
+              content: finalContent,
+              timestamp: new Date()
+            };
+          }
+          return { ...conv, messages: updated, updatedAt: new Date() };
         }
         return conv;
       }));
+
     } catch (err: any) {
       setError('Failed to generate response: ' + (err?.message || String(err)));
       console.error(err);
@@ -354,10 +607,17 @@ export default function WllamaUI() {
           <button
             onClick={createNewConversation}
             disabled={!wllamaRef.current}
-            className="w-full bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2"
+            className="w-full bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 mb-2"
           >
             <Plus className="w-4 h-4" />
             New conversation
+          </button>
+          <button
+            onClick={() => setShowModelManager(true)}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition-colors flex items-center justify-center gap-2"
+          >
+            <HardDrive className="w-4 h-4" />
+            Manage models
           </button>
         </div>
         
@@ -395,6 +655,243 @@ export default function WllamaUI() {
         </div>
       </div>
 
+      {/* Model Manager Modal */}
+      {showModelManager && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 rounded-2xl border border-white/20 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+            <div className="p-6 border-b border-white/10 flex items-center justify-between sticky top-0 bg-slate-900">
+              <h2 className="text-2xl font-bold text-white">Manage Models</h2>
+              <button
+                onClick={() => setShowModelManager(false)}
+                className="text-white hover:bg-white/10 p-2 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6">
+              {/* Load Method Tabs */}
+              <div className="flex gap-2 mb-6">
+                <button
+                  onClick={() => setLoadMethod('url')}
+                  className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors flex items-center justify-center gap-2 ${
+                    loadMethod === 'url'
+                      ? 'bg-purple-600 text-white'
+                      : 'bg-white/10 text-purple-200 hover:bg-white/20'
+                  }`}
+                >
+                  <Globe className="w-4 h-4" />
+                  From URL
+                </button>
+                <button
+                  onClick={() => setLoadMethod('file')}
+                  className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors flex items-center justify-center gap-2 ${
+                    loadMethod === 'file'
+                      ? 'bg-purple-600 text-white'
+                      : 'bg-white/10 text-purple-200 hover:bg-white/20'
+                  }`}
+                >
+                  <Upload className="w-4 h-4" />
+                  From File
+                </button>
+              </div>
+
+              {/* Load from URL */}
+              {loadMethod === 'url' && (
+                <div className="mb-6">
+                  <label className="block text-white font-semibold mb-3">
+                    Hugging Face Repository or Direct URL
+                  </label>
+                  <input
+                    type="text"
+                    value={modelUrl}
+                    onChange={(e) => handleRepoInputChange(e.target.value)}
+                    placeholder="e.g., ggml-org/gemma-3-270m-it-GGUF"
+                    className="w-full bg-white/10 border border-white/20 text-white placeholder-gray-400 rounded-lg p-3 mb-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  />
+                  
+                  {fetchingFiles && (
+                    <div className="flex items-center gap-2 text-purple-300 mb-3">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span className="text-sm">Fetching repository files...</span>
+                    </div>
+                  )}
+                  
+                  {availableFiles.length > 0 && (
+                    <div className="mb-3">
+                      <label className="block text-purple-200 text-sm mb-2">
+                        Select a GGUF file ({availableFiles.length} available)
+                      </label>
+                      <select
+                        value={selectedFile}
+                        onChange={(e) => setSelectedFile(e.target.value)}
+                        className="w-full bg-white/10 border border-white/20 text-white rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      >
+                        <option value="">Choose a file...</option>
+                        {availableFiles.map((file) => (
+                          <option key={file} value={file}>
+                            {file}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                  
+                  <button
+                    onClick={() => loadModelFromUrl(modelUrl)}
+                    disabled={(!selectedFile && availableFiles.length > 0) || isLoading || !modelUrl}
+                    className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-lg transition-colors flex items-center justify-center gap-2"
+                  >
+                    {isLoading ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        Loading... {loadProgress}%
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-5 h-5" />
+                        {availableFiles.length > 0 ? 'Download & Load Selected' : 'Download & Load Model'}
+                      </>
+                    )}
+                  </button>
+                  
+                  <div className="mt-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+                    <p className="text-blue-200 text-xs">
+                      <strong>Examples:</strong><br />
+                      • ggml-org/gemma-3-270m-it-GGUF (Gemma)<br />
+                      • Qwen/Qwen2.5-0.5B-Instruct-GGUF (Qwen)<br />
+                      • TheBloke/Llama-2-7B-Chat-GGUF (Llama)<br />
+                      • Or paste a direct .gguf URL
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Load from File */}
+              {loadMethod === 'file' && (
+                <div className="mb-6">
+                  <label className="block text-white font-semibold mb-3">
+                    Select Local .gguf File
+                  </label>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".gguf"
+                    multiple
+                    onChange={handleFileSelect}
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    className="w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors flex items-center justify-center gap-2 mb-3"
+                  >
+                    <Upload className="w-5 h-5" />
+                    Choose File
+                  </button>
+                  {modelFile && (
+                    <p className="text-green-300 text-sm mb-3">
+                      Selected: {modelFile.length} file(s)
+                    </p>
+                  )}
+                  <button
+                    onClick={loadModelFromFile}
+                    disabled={!modelFile || isLoading}
+                    className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-lg transition-colors flex items-center justify-center gap-2"
+                  >
+                    {isLoading ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        Loading... {loadProgress}%
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-5 h-5" />
+                        Load Model
+                      </>
+                    )}
+                  </button>
+                </div>
+              )}
+
+              {/* Context Size Setting */}
+              <div className="mb-6 bg-white/5 border border-white/10 rounded-lg p-4">
+                <label className="block text-purple-200 text-sm mb-2">
+                  Context Size: {nCtx}
+                </label>
+                <input
+                  type="range"
+                  min="128"
+                  max="8192"
+                  step="128"
+                  value={nCtx}
+                  onChange={(e) => setNCtx(Number(e.target.value))}
+                  className="w-full"
+                />
+              </div>
+
+              {/* Chat Template Selection */}
+              <div className="mb-6 bg-white/5 border border-white/10 rounded-lg p-4">
+                <label className="block text-white font-semibold mb-3">
+                  Chat Template
+                </label>
+                <select
+                  value={chatTemplate}
+                  onChange={(e) => setChatTemplate(e.target.value as any)}
+                  className="w-full bg-white/10 border border-white/20 text-white rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                >
+                  <option value="gemma">Gemma (Google)</option>
+                  <option value="qwen">Qwen (Alibaba)</option>
+                  <option value="llama">Llama 2/3 (Meta)</option>
+                  <option value="chatml">ChatML (General)</option>
+                </select>
+                <p className="text-purple-300 text-xs mt-2">
+                  Choose the template matching your model's training format
+                </p>
+              </div>
+
+              {/* Cached Models List */}
+              <div>
+                <h3 className="text-white font-semibold mb-3">Cached Models ({cachedModels.length})</h3>
+                <div className="space-y-2">
+                  {cachedModels.length === 0 ? (
+                    <p className="text-purple-300 text-sm">No models cached yet</p>
+                  ) : (
+                    cachedModels.map((model) => (
+                      <div
+                        key={model.url}
+                        className="bg-white/5 border border-white/10 rounded-lg p-4 flex items-center justify-between"
+                      >
+                        <div className="flex-1">
+                          <p className="text-white font-medium">{model.name}</p>
+                          <p className="text-purple-300 text-xs">
+                            Size: {(model.size / 1024 / 1024).toFixed(1)} MB
+                          </p>
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => loadModelFromUrl(model.url)}
+                            disabled={isLoading}
+                            className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white px-4 py-2 rounded-lg text-sm"
+                          >
+                            Load
+                          </button>
+                          <button
+                            onClick={() => deleteCachedModel(model.url)}
+                            className="bg-red-600 hover:bg-red-700 text-white p-2 rounded-lg"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main Content */}
       <div className="flex-1 flex flex-col h-screen">
         {/* Header */}
@@ -417,83 +914,6 @@ export default function WllamaUI() {
           </div>
         </div>
 
-        {/* Model Loading Section */}
-        {!wllamaRef.current && (
-          <div className="bg-white/5 border-b border-white/10 p-6">
-            <div className="max-w-3xl mx-auto">
-              <div className="mb-4">
-                <label className="block text-white font-semibold mb-3">
-                  <FileText className="inline w-5 h-5 mr-2" />
-                  Select Model File (.gguf)
-                </label>
-                <div className="flex gap-3">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept=".gguf"
-                    multiple
-                    onChange={handleFileSelect}
-                    className="hidden"
-                  />
-                  <button
-                    onClick={() => fileInputRef.current?.click()}
-                    className="flex-1 bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors flex items-center justify-center gap-2"
-                  >
-                    <Upload className="w-5 h-5" />
-                    Choose File
-                  </button>
-                  <button
-                    onClick={loadModel}
-                    disabled={!modelFile || isLoading}
-                    className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-lg transition-colors flex items-center justify-center gap-2"
-                  >
-                    {isLoading && loadProgress < 100 ? (
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                    ) : (
-                      <Play className="w-5 h-5" />
-                    )}
-                    Load Model
-                  </button>
-                </div>
-                {modelFile && (
-                  <p className="text-green-300 text-sm mt-2">
-                    Selected: {modelFile.length} file(s)
-                  </p>
-                )}
-              </div>
-
-              <div className="mb-4">
-                <label className="block text-purple-200 text-sm mb-2">
-                  Context Size: {nCtx}
-                </label>
-                <input
-                  type="range"
-                  min="128"
-                  max="8192"
-                  step="128"
-                  value={nCtx}
-                  onChange={(e) => setNCtx(Number(e.target.value))}
-                  className="w-full"
-                />
-              </div>
-
-              {loadProgress > 0 && loadProgress < 100 && (
-                <div className="mb-4">
-                  <div className="bg-white/20 rounded-full h-3 overflow-hidden">
-                    <div
-                      className="bg-gradient-to-r from-purple-500 to-pink-500 h-full transition-all duration-300"
-                      style={{ width: `${loadProgress}%` }}
-                    />
-                  </div>
-                  <p className="text-white text-sm mt-2 text-center">
-                    {loadProgress}%
-                  </p>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
         {/* Status Messages */}
         {status && (
           <div className="bg-blue-500/20 border-b border-blue-400/50 text-blue-100 px-6 py-3">
@@ -514,6 +934,20 @@ export default function WllamaUI() {
               <Bot className="w-16 h-16 mx-auto mb-4 opacity-50" />
               <p className="text-lg">Start a conversation!</p>
               <p className="text-sm mt-2">Type a message below to begin chatting.</p>
+            </div>
+          )}
+
+          {!wllamaRef.current && (
+            <div className="text-center text-purple-300 py-12">
+              <HardDrive className="w-16 h-16 mx-auto mb-4 opacity-50" />
+              <p className="text-lg">No model loaded</p>
+              <p className="text-sm mt-2 mb-4">Click "Manage models" to get started</p>
+              <button
+                onClick={() => setShowModelManager(true)}
+                className="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-6 rounded-lg transition-colors"
+              >
+                Open Model Manager
+              </button>
             </div>
           )}
 
