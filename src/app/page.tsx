@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
-import { Upload, Play, Loader2, FileText, Send, Trash2, User, Bot, Download, Save, Plus, MessageSquare, Menu, X, Globe, HardDrive } from 'lucide-react';
+import { useState, useRef, useEffect, useMemo } from 'react';
+import { Upload, Play, Loader2, Send, Trash2, User, Bot, Download, Save, Plus, MessageSquare, Menu, X, Globe, HardDrive } from 'lucide-react';
 
 interface ProgressCallback {
   loaded: number;
@@ -85,7 +85,7 @@ export default function WllamaUI() {
           }))
         }));
         setConversations(conversationsWithDates);
-        
+
         const lastActiveId = localStorage.getItem('wllama-last-conversation-id');
         if (lastActiveId && conversationsWithDates.find((c: Conversation) => c.id === lastActiveId)) {
           setCurrentConversationId(lastActiveId);
@@ -112,12 +112,11 @@ export default function WllamaUI() {
   }, [currentConversationId]);
 
   const currentConversation = conversations.find(c => c.id === currentConversationId);
-  const messages = currentConversation?.messages || [];
+  const messages = useMemo(() => currentConversation?.messages || [], [currentConversation]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
-
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
@@ -143,19 +142,19 @@ export default function WllamaUI() {
     setAvailableFiles([]);
     setSelectedFile('');
     setError('');
-    
+
     try {
       // Fetch file list from Hugging Face API
       const response = await fetch(`https://huggingface.co/api/models/${repoId}/tree/main`);
       if (!response.ok) {
         throw new Error('Repository not found or inaccessible');
       }
-      
+
       const data = await response.json();
       const ggufFiles = data
         .filter((item: any) => item.path.endsWith('.gguf'))
         .map((item: any) => item.path);
-      
+
       if (ggufFiles.length === 0) {
         setError('No .gguf files found in this repository');
       } else {
@@ -173,7 +172,7 @@ export default function WllamaUI() {
 
   const handleRepoInputChange = (value: string) => {
     setModelUrl(value);
-    
+
     // Auto-fetch files if input looks like a repo ID
     const repoPattern = /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+$/;
     if (repoPattern.test(value)) {
@@ -250,7 +249,7 @@ export default function WllamaUI() {
 
       const WllamaModule = await import('@wllama/wllama/esm/index.js');
       const Wllama = WllamaModule.Wllama;
-      
+
       const CONFIG_PATHS = {
         'single-thread/wllama.wasm': './wllama/esm/single-thread/wllama.wasm',
         'multi-thread/wllama.wasm': './wllama/esm/multi-thread/wllama.wasm',
@@ -265,9 +264,9 @@ export default function WllamaUI() {
       };
 
       setStatus('Downloading model from URL...');
-      
+
       const start = Date.now();
-      
+
       const config: WllamaConfig = {
         n_ctx: nCtx,
         n_batch: 2048,
@@ -277,18 +276,18 @@ export default function WllamaUI() {
         use_mmap: true,
         progressCallback,
       };
-      
+
       await wllamaRef.current.loadModelFromUrl(fullUrl, config);
-      
+
       const took = Date.now() - start;
       setStatus(`Model loaded successfully! (${took} ms)`);
       setLoadProgress(100);
       setShowModelManager(false);
-      
+
       if (conversations.length === 0) {
         createNewConversation();
       }
-      
+
       await loadCachedModels();
     } catch (err: any) {
       setError('Failed to load model: ' + (err?.message || String(err)));
@@ -313,7 +312,7 @@ export default function WllamaUI() {
     try {
       const WllamaModule = await import('@wllama/wllama/esm/index.js');
       const Wllama = WllamaModule.Wllama;
-      
+
       const CONFIG_PATHS = {
         'single-thread/wllama.wasm': './wllama/esm/single-thread/wllama.wasm',
         'multi-thread/wllama.wasm': './wllama/esm/multi-thread/wllama.wasm',
@@ -328,10 +327,10 @@ export default function WllamaUI() {
       };
 
       setStatus('Loading model from files...');
-      
+
       const start = Date.now();
       const blobs = Array.from(modelFile);
-      
+
       const config: WllamaConfig = {
         n_ctx: nCtx,
         n_batch: 2048,
@@ -341,14 +340,14 @@ export default function WllamaUI() {
         use_mmap: true,
         progressCallback,
       };
-      
+
       await wllamaRef.current.loadModel(blobs, config);
-      
+
       const took = Date.now() - start;
       setStatus(`Model loaded successfully! (${took} ms)`);
       setLoadProgress(100);
       setShowModelManager(false);
-      
+
       if (conversations.length === 0) {
         createNewConversation();
       }
@@ -380,7 +379,7 @@ export default function WllamaUI() {
 
   const buildConversationPrompt = (messages: Message[], newUserMessage: string) => {
     let prompt = '';
-    
+
     switch (chatTemplate) {
       case 'gemma':
         // Gemma format
@@ -393,7 +392,7 @@ export default function WllamaUI() {
         });
         prompt += `<start_of_turn>user\n${newUserMessage}<end_of_turn>\n<start_of_turn>model\n`;
         break;
-        
+
       case 'qwen':
         // Qwen format
         messages.forEach(msg => {
@@ -405,7 +404,7 @@ export default function WllamaUI() {
         });
         prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
         break;
-        
+
       case 'llama':
         // Llama 2/3 format
         messages.forEach(msg => {
@@ -417,7 +416,7 @@ export default function WllamaUI() {
         });
         prompt += `[INST] ${newUserMessage} [/INST]\n`;
         break;
-        
+
       case 'chatml':
         // ChatML format (used by many models)
         messages.forEach(msg => {
@@ -426,7 +425,7 @@ export default function WllamaUI() {
         prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
         break;
     }
-    
+
     return prompt;
   };
 
@@ -478,7 +477,7 @@ export default function WllamaUI() {
 
       // Get the index for the assistant's message
       const assistantMessageIndex = messages.length + 1; // +1 because we just added user message
-      
+
       // Add placeholder for assistant response
       setConversations(prev => prev.map(conv => {
         if (conv.id === currentConversationId) {
@@ -510,7 +509,7 @@ export default function WllamaUI() {
         },
         onNewToken: (token: number, piece: Uint8Array, currentText: string) => {
           fullContent = currentText;
-          
+
           // Remove thinking blocks in real-time
           displayContent = currentText
             .replace(/<think>[\s\S]*?<\/think>/gi, '')
@@ -582,11 +581,11 @@ export default function WllamaUI() {
 
   const exportChat = () => {
     if (!currentConversation) return;
-    
-    const chatText = currentConversation.messages.map(msg => 
+
+    const chatText = currentConversation.messages.map(msg =>
       `[${msg.timestamp.toLocaleString()}] ${msg.role.toUpperCase()}: ${msg.content}`
     ).join('\n\n');
-    
+
     const blob = new Blob([chatText], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -620,16 +619,15 @@ export default function WllamaUI() {
             Manage models
           </button>
         </div>
-        
+
         <div className="flex-1 overflow-y-auto p-2">
           {conversations.map(conv => (
             <div
               key={conv.id}
-              className={`group relative mb-1 p-3 rounded-lg cursor-pointer transition-colors ${
-                currentConversationId === conv.id
-                  ? 'bg-purple-600/30 border border-purple-500/50'
-                  : 'bg-white/5 hover:bg-white/10'
-              }`}
+              className={`group relative mb-1 p-3 rounded-lg cursor-pointer transition-colors ${currentConversationId === conv.id
+                ? 'bg-purple-600/30 border border-purple-500/50'
+                : 'bg-white/5 hover:bg-white/10'
+                }`}
               onClick={() => setCurrentConversationId(conv.id)}
             >
               <div className="flex items-start gap-2">
@@ -674,22 +672,20 @@ export default function WllamaUI() {
               <div className="flex gap-2 mb-6">
                 <button
                   onClick={() => setLoadMethod('url')}
-                  className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors flex items-center justify-center gap-2 ${
-                    loadMethod === 'url'
-                      ? 'bg-purple-600 text-white'
-                      : 'bg-white/10 text-purple-200 hover:bg-white/20'
-                  }`}
+                  className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors flex items-center justify-center gap-2 ${loadMethod === 'url'
+                    ? 'bg-purple-600 text-white'
+                    : 'bg-white/10 text-purple-200 hover:bg-white/20'
+                    }`}
                 >
                   <Globe className="w-4 h-4" />
                   From URL
                 </button>
                 <button
                   onClick={() => setLoadMethod('file')}
-                  className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors flex items-center justify-center gap-2 ${
-                    loadMethod === 'file'
-                      ? 'bg-purple-600 text-white'
-                      : 'bg-white/10 text-purple-200 hover:bg-white/20'
-                  }`}
+                  className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors flex items-center justify-center gap-2 ${loadMethod === 'file'
+                    ? 'bg-purple-600 text-white'
+                    : 'bg-white/10 text-purple-200 hover:bg-white/20'
+                    }`}
                 >
                   <Upload className="w-4 h-4" />
                   From File
@@ -709,14 +705,14 @@ export default function WllamaUI() {
                     placeholder="e.g., ggml-org/gemma-3-270m-it-GGUF"
                     className="w-full bg-white/10 border border-white/20 text-white placeholder-gray-400 rounded-lg p-3 mb-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
                   />
-                  
+
                   {fetchingFiles && (
                     <div className="flex items-center gap-2 text-purple-300 mb-3">
                       <Loader2 className="w-4 h-4 animate-spin" />
                       <span className="text-sm">Fetching repository files...</span>
                     </div>
                   )}
-                  
+
                   {availableFiles.length > 0 && (
                     <div className="mb-3">
                       <label className="block text-purple-200 text-sm mb-2">
@@ -736,7 +732,7 @@ export default function WllamaUI() {
                       </select>
                     </div>
                   )}
-                  
+
                   <button
                     onClick={() => loadModelFromUrl(modelUrl)}
                     disabled={(!selectedFile && availableFiles.length > 0) || isLoading || !modelUrl}
@@ -754,7 +750,7 @@ export default function WllamaUI() {
                       </>
                     )}
                   </button>
-                  
+
                   <div className="mt-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
                     <p className="text-blue-200 text-xs">
                       <strong>Examples:</strong><br />
@@ -845,7 +841,7 @@ export default function WllamaUI() {
                   <option value="chatml">ChatML (General)</option>
                 </select>
                 <p className="text-purple-300 text-xs mt-2">
-                  Choose the template matching your model's training format
+                  Choose the template matching your model&lsquo;s training format
                 </p>
               </div>
 
@@ -941,7 +937,7 @@ export default function WllamaUI() {
             <div className="text-center text-purple-300 py-12">
               <HardDrive className="w-16 h-16 mx-auto mb-4 opacity-50" />
               <p className="text-lg">No model loaded</p>
-              <p className="text-sm mt-2 mb-4">Click "Manage models" to get started</p>
+              <p className="text-sm mt-2 mb-4">Click &quot;Manage models&quot; to get started</p>
               <button
                 onClick={() => setShowModelManager(true)}
                 className="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-6 rounded-lg transition-colors"
@@ -954,22 +950,20 @@ export default function WllamaUI() {
           {messages.map((message, index) => (
             <div
               key={index}
-              className={`flex gap-3 ${
-                message.role === 'user' ? 'justify-end' : 'justify-start'
-              }`}
+              className={`flex gap-3 ${message.role === 'user' ? 'justify-end' : 'justify-start'
+                }`}
             >
               {message.role === 'assistant' && (
                 <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-600 flex items-center justify-center">
                   <Bot className="w-5 h-5 text-white" />
                 </div>
               )}
-              
+
               <div
-                className={`max-w-[70%] rounded-2xl p-4 ${
-                  message.role === 'user'
-                    ? 'bg-purple-600 text-white'
-                    : 'bg-white/10 text-white border border-white/20'
-                }`}
+                className={`max-w-[70%] rounded-2xl p-4 ${message.role === 'user'
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-white/10 text-white border border-white/20'
+                  }`}
               >
                 <p className="whitespace-pre-wrap break-words">{message.content}</p>
                 <p className="text-xs mt-2 opacity-60">
@@ -1033,7 +1027,7 @@ export default function WllamaUI() {
             </div>
             <div className="flex items-center justify-between mt-2">
               <p className="text-xs text-purple-300">
-                Press Enter to send • Shift+Enter for new line
+                Press Enter to send &bull; Shift+Enter for new line
               </p>
               {conversations.length > 0 && (
                 <p className="text-xs text-green-300 flex items-center gap-1">

@@ -11,7 +11,7 @@ RUN echo "Copied npm metadata and tarball"
 
 RUN ls -la
 
-RUN npm install --no-audit --prefer-offline --legacy-peer-deps
+RUN npm install --no-audit --prefer-offline
 
 # copy rest of source
 COPY . .
