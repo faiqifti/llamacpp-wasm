@@ -1,7 +1,24 @@
 'use client';
 
 import { useState, useRef, useEffect, useMemo } from 'react';
-import { Upload, Play, Loader2, Send, Trash2, User, Bot, Download, Save, Plus, MessageSquare, Menu, X, Globe, HardDrive } from 'lucide-react';
+import { 
+  Upload, 
+  Play, 
+  Loader2, 
+  Send, 
+  Trash2, 
+  User, 
+  Download, 
+  Save, 
+  Plus, 
+  MessageSquare, 
+  Menu, 
+  X, 
+  Globe, 
+  HardDrive, 
+  FileText,
+  MessageCircle // Replace Bot with MessageCircle
+} from 'lucide-react';
 
 interface ProgressCallback {
   loaded: number;
@@ -28,6 +45,15 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: Date;
+  attachments?: Attachment[];
+}
+
+interface Attachment {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  content: string; // Extracted text content
 }
 
 interface Conversation {
@@ -42,6 +68,234 @@ interface CachedModel {
   url: string;
   size: number;
   name: string;
+}
+
+// Add these new interfaces at the top
+interface DocumentChunk {
+  id: string;
+  documentId: string;
+  content: string;
+  embedding: number[];
+  metadata: {
+    chunkIndex: number;
+    startPos: number;
+    endPos: number;
+  };
+}
+
+interface StoredDocument {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  content: string;
+  chunks: DocumentChunk[];
+  processedAt: Date;
+}
+
+// Add these imports at the top
+import { pipeline, env } from '@xenova/transformers';
+
+// Mock embedding function (in production, use a proper embedding model)
+const generateEmbedding = async (text: string): Promise<number[]> => {
+  // Simple mock embedding - replace with real embedding model
+  const embedding = new Array(384).fill(0);
+  for (let i = 0; i < Math.min(text.length, 384); i++) {
+    embedding[i] = text.charCodeAt(i) / 65535;
+  }
+  return embedding;
+};
+
+const cosineSimilarity = (a: number[], b: number[]): number => {
+  const dotProduct = a.reduce((sum, val, i) => sum + val * b[i], 0);
+  const magnitudeA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
+  const magnitudeB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
+  return dotProduct / (magnitudeA * magnitudeB);
+};
+
+// Document Processor Class
+class DocumentProcessor {
+  private db: IDBDatabase | null = null;
+  private readonly DB_NAME = 'WllamaDocuments';
+  private readonly DB_VERSION = 1;
+  private readonly STORE_NAME = 'documents';
+
+  async init(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(this.DB_NAME, this.DB_VERSION);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        this.db = request.result;
+        resolve();
+      };
+
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(this.STORE_NAME)) {
+          const store = db.createObjectStore(this.STORE_NAME, { keyPath: 'id' });
+          store.createIndex('name', 'name', { unique: false });
+          store.createIndex('processedAt', 'processedAt', { unique: false });
+        }
+      };
+    });
+  }
+
+  async chunkDocument(content: string, chunkSize: number = 500, overlap: number = 50): Promise<string[]> {
+    const chunks: string[] = [];
+    let start = 0;
+
+    while (start < content.length) {
+      let end = start + chunkSize;
+      
+      // Try to break at sentence end
+      const sentenceEnd = content.slice(start, end).lastIndexOf('.');
+      if (sentenceEnd > chunkSize * 0.5) {
+        end = start + sentenceEnd + 1;
+      }
+
+      // Try to break at paragraph end
+      const paragraphEnd = content.slice(start, end).lastIndexOf('\n\n');
+      if (paragraphEnd > chunkSize * 0.5) {
+        end = start + paragraphEnd + 2;
+      }
+
+      const chunk = content.slice(start, end).trim();
+      if (chunk.length > 0) {
+        chunks.push(chunk);
+      }
+
+      start = end - overlap;
+      if (start >= content.length) break;
+    }
+
+    return chunks;
+  }
+
+  async processDocument(file: File, content: string): Promise<StoredDocument> {
+    if (!this.db) await this.init();
+
+    const chunks = await this.chunkDocument(content);
+    const documentChunks: DocumentChunk[] = [];
+
+    for (let i = 0; i < chunks.length; i++) {
+      const embedding = await generateEmbedding(chunks[i]);
+      documentChunks.push({
+        id: `${file.name}-chunk-${i}`,
+        documentId: file.name,
+        content: chunks[i],
+        embedding,
+        metadata: {
+          chunkIndex: i,
+          startPos: i * 500,
+          endPos: (i * 500) + chunks[i].length
+        }
+      });
+    }
+
+    const document: StoredDocument = {
+      id: file.name,
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      content: content.substring(0, 1000), // Store only preview
+      chunks: documentChunks,
+      processedAt: new Date()
+    };
+
+    // Store in IndexedDB
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      const transaction = this.db.transaction([this.STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(this.STORE_NAME);
+      const request = store.put(document);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(document);
+    });
+  }
+
+  async searchDocuments(query: string, limit: number = 3): Promise<DocumentChunk[]> {
+    if (!this.db) await this.init();
+
+    const queryEmbedding = await generateEmbedding(query);
+    const allChunks: DocumentChunk[] = [];
+
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      const transaction = this.db.transaction([this.STORE_NAME], 'readonly');
+      const store = transaction.objectStore(this.STORE_NAME);
+      const request = store.getAll();
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const documents: StoredDocument[] = request.result;
+        
+        // Collect all chunks from all documents
+        documents.forEach(doc => {
+          allChunks.push(...doc.chunks);
+        });
+
+        // Calculate similarity scores
+        const scoredChunks = allChunks.map(chunk => ({
+          chunk,
+          score: cosineSimilarity(queryEmbedding, chunk.embedding)
+        }));
+
+        // Sort by similarity and return top chunks
+        const topChunks = scoredChunks
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit)
+          .map(item => item.chunk);
+
+        resolve(topChunks);
+      };
+    });
+  }
+
+  async getAllDocuments(): Promise<StoredDocument[]> {
+    if (!this.db) await this.init();
+
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      const transaction = this.db.transaction([this.STORE_NAME], 'readonly');
+      const store = transaction.objectStore(this.STORE_NAME);
+      const request = store.getAll();
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+  }
+
+  async deleteDocument(documentId: string): Promise<void> {
+    if (!this.db) await this.init();
+
+    return new Promise((resolve, reject) => {
+      if (!this.db) {
+        reject(new Error('Database not initialized'));
+        return;
+      }
+
+      const transaction = this.db.transaction([this.STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(this.STORE_NAME);
+      const request = store.delete(documentId);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve();
+    });
+  }
 }
 
 export default function WllamaUI() {
@@ -64,10 +318,25 @@ export default function WllamaUI() {
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [fetchingFiles, setFetchingFiles] = useState(false);
   const [chatTemplate, setChatTemplate] = useState<'gemma' | 'qwen' | 'llama' | 'chatml'>('gemma');
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const [isProcessingFiles, setIsProcessingFiles] = useState(false);
   const wllamaRef = useRef<Wllama | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const documentInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  const [documentProcessor] = useState(new DocumentProcessor());
+  const [processedDocuments, setProcessedDocuments] = useState<StoredDocument[]>([]);
+
+  // Initialize document processor
+  useEffect(() => {
+    documentProcessor.init().then(() => {
+      documentProcessor.getAllDocuments().then(docs => {
+        setProcessedDocuments(docs);
+      });
+    });
+  }, [documentProcessor]);
 
   // Load conversations from localStorage on mount
   useEffect(() => {
@@ -193,6 +462,7 @@ export default function WllamaUI() {
     };
     setConversations(prev => [newConv, ...prev]);
     setCurrentConversationId(newConv.id);
+    setAttachedFiles([]);
   };
 
   const updateConversationTitle = (conversationId: string, firstMessage: string) => {
@@ -212,6 +482,7 @@ export default function WllamaUI() {
     if (currentConversationId === conversationId) {
       const remaining = conversations.filter(c => c.id !== conversationId);
       setCurrentConversationId(remaining.length > 0 ? remaining[0].id : null);
+      setAttachedFiles([]);
     }
   };
 
@@ -229,65 +500,239 @@ export default function WllamaUI() {
     }
   };
 
+  // Handle document file selection (PDF, CSV, DOC, DOCX)
+  const handleDocumentSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      const validFiles = Array.from(files).filter(file => {
+        const fileType = file.type.toLowerCase();
+        const fileName = file.name.toLowerCase();
+        return (
+          fileType.includes('pdf') ||
+          fileType.includes('csv') ||
+          fileType.includes('text/csv') ||
+          fileName.endsWith('.csv') ||
+          fileType.includes('msword') ||
+          fileType.includes('wordprocessingml') ||
+          fileName.endsWith('.doc') ||
+          fileName.endsWith('.docx') ||
+          fileType.includes('text/plain') ||
+          fileName.endsWith('.txt')
+        );
+      });
+
+      if (validFiles.length > 0) {
+        setAttachedFiles(prev => [...prev, ...validFiles]);
+        setError('');
+      } else {
+        setError('Please select valid PDF, CSV, DOC, DOCX, or TXT files');
+      }
+    }
+  };
+
+  // Remove attached file
+  const removeAttachedFile = (index: number) => {
+    setAttachedFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  // Extract text from different file types
+  const extractTextFromFile = async (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const fileType = file.type.toLowerCase();
+      const fileName = file.name.toLowerCase();
+
+      // For CSV and text files
+      if (fileType.includes('csv') || fileType.includes('text/plain') || fileName.endsWith('.txt')) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const content = e.target?.result as string || '';
+          // Clean up CSV content - remove extra spaces and normalize
+          const cleanedContent = content.split('\n')
+            .map(line => line.trim())
+            .filter(line => line.length > 0)
+            .join('\n');
+          resolve(cleanedContent);
+        };
+        reader.onerror = () => reject(new Error('Failed to read file'));
+        reader.readAsText(file);
+      }
+      // For PDF files - improved extraction
+      else if (fileType.includes('pdf') || fileName.endsWith('.pdf')) {
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+          try {
+            // Basic PDF text extraction
+            const arrayBuffer = e.target?.result as ArrayBuffer;
+            if (arrayBuffer) {
+              // Convert to text using basic extraction
+              const uint8Array = new Uint8Array(arrayBuffer);
+              let text = '';
+              
+              // Simple PDF text extraction (basic approach)
+              // This extracts text between BT and ET operators (text objects in PDF)
+              const decoder = new TextDecoder('iso-8859-1');
+              const pdfText = decoder.decode(uint8Array);
+              
+              // Extract text between text operators
+              const textMatches = pdfText.match(/BT[\s\S]*?ET/g) || [];
+              if (textMatches.length > 0) {
+                text = textMatches.map(match => {
+                  // Extract text content between BT and ET
+                  return match.replace(/BT|ET/g, '')
+                    .replace(/Td|Tj|TJ|Tm|Tf/g, ' ')
+                    .replace(/[\(\)]/g, '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                }).join(' ');
+              } else {
+                // Fallback: try to extract any readable text
+                text = pdfText.replace(/[^\x20-\x7E\n\r]/g, ' ')
+                  .replace(/\s+/g, ' ')
+                  .trim();
+              }
+              
+              resolve(text || `PDF file: ${file.name} - Text extraction limited. For better results, consider converting to text first.`);
+            } else {
+              resolve(`PDF file: ${file.name} - Could not read file content`);
+            }
+          } catch (err) {
+            console.error('PDF extraction error:', err);
+            resolve(`PDF file: ${file.name} - Error extracting text. Consider using a text-based file format.`);
+          }
+        };
+        reader.onerror = () => reject(new Error('Failed to read PDF file'));
+        reader.readAsArrayBuffer(file);
+      }
+      // For DOC/DOCX files
+      else if (fileType.includes('msword') || fileType.includes('wordprocessingml') || 
+              fileName.endsWith('.doc') || fileName.endsWith('.docx')) {
+        resolve(`Word Document: ${file.name}\n\nDOC/DOCX text extraction requires additional libraries. For best results, please save as PDF or TXT format and upload again.`);
+      }
+      else {
+        resolve(`Unsupported file type: ${file.name}. Please use PDF, CSV, TXT, DOC, or DOCX files.`);
+      }
+    });
+  };
+
+  // Process all attached files and extract text
+  const processAttachedFiles = async (): Promise<Attachment[]> => {
+    if (attachedFiles.length === 0) return [];
+  
+    setIsProcessingFiles(true);
+    setStatus('Processing and indexing documents...');
+  
+    try {
+      const attachments: Attachment[] = [];
+  
+      for (const file of attachedFiles) {
+        try {
+          const content = await extractTextFromFile(file);
+          
+          // Process document with vector storage
+          const processedDoc = await documentProcessor.processDocument(file, content);
+          setProcessedDocuments(prev => [...prev, processedDoc]);
+  
+          attachments.push({
+            id: processedDoc.id,
+            name: file.name,
+            type: file.type,
+            size: file.size,
+            content: `Document processed and indexed. ${processedDoc.chunks.length} chunks created.`
+          });
+  
+        } catch (err) {
+          console.error(`Failed to process file ${file.name}:`, err);
+          attachments.push({
+            id: Date.now().toString() + Math.random(),
+            name: file.name,
+            type: file.type,
+            size: file.size,
+            content: `[Error processing file: ${file.name}]`
+          });
+        }
+      }
+  
+      setStatus('');
+      return attachments;
+    } catch (err) {
+      setError('Failed to process attached files');
+      return [];
+    } finally {
+      setIsProcessingFiles(false);
+    }
+  };
+
   const loadModelFromUrl = async (url: string) => {
     setIsLoading(true);
     setError('');
     setLoadProgress(0);
     setStatus('Initializing Wllama...');
-
+  
     try {
       // Construct full URL if needed
       let fullUrl = url;
+      
+      // If it's a repository ID (not a direct URL)
       if (!url.startsWith('http')) {
-        // Assume it's a repo ID with a selected file
+        // Check if we have available files and a selection
+        if (availableFiles.length > 0 && !selectedFile) {
+          throw new Error('Please select a file from the repository');
+        }
+        
         if (selectedFile) {
           fullUrl = `https://huggingface.co/${modelUrl}/resolve/main/${selectedFile}`;
         } else {
-          throw new Error('Please select a file from the repository');
+          // If no files available yet, try to auto-select the first one
+          if (availableFiles.length > 0) {
+            fullUrl = `https://huggingface.co/${modelUrl}/resolve/main/${availableFiles[0]}`;
+            setSelectedFile(availableFiles[0]);
+          } else {
+            throw new Error('No GGUF files found in this repository or repository not found');
+          }
         }
       }
-
+  
       const WllamaModule = await import('@wllama/wllama/esm/index.js');
       const Wllama = WllamaModule.Wllama;
-
+  
       const CONFIG_PATHS = {
         'single-thread/wllama.wasm': './wllama/esm/single-thread/wllama.wasm',
         'multi-thread/wllama.wasm': './wllama/esm/multi-thread/wllama.wasm',
       };
-
+  
       wllamaRef.current = new Wllama(CONFIG_PATHS);
-
+  
       const progressCallback = ({ loaded, total }: ProgressCallback) => {
         const progressPercentage = Math.round((loaded / total) * 100);
         setLoadProgress(progressPercentage);
         setStatus(`Loading model... ${progressPercentage}%`);
       };
-
+  
       setStatus('Downloading model from URL...');
-
+  
       const start = Date.now();
-
+  
       const config: WllamaConfig = {
         n_ctx: nCtx,
         n_batch: 2048,
-        n_threads: navigator.hardwareConcurrency || 8, // Use all available CPU threads
+        n_threads: navigator.hardwareConcurrency || 8,
         n_gpu_layers: 0,
         use_mlock: false,
         use_mmap: true,
         progressCallback,
       };
-
+  
       await wllamaRef.current.loadModelFromUrl(fullUrl, config);
-
+  
       const took = Date.now() - start;
       setStatus(`Model loaded successfully! (${took} ms)`);
       setLoadProgress(100);
       setShowModelManager(false);
-
+  
       if (conversations.length === 0) {
         createNewConversation();
       }
-
+  
       await loadCachedModels();
     } catch (err: any) {
       setError('Failed to load model: ' + (err?.message || String(err)));
@@ -377,12 +822,76 @@ export default function WllamaUI() {
     }
   };
 
-  const buildConversationPrompt = (messages: Message[], newUserMessage: string) => {
+  // const buildConversationPrompt = (messages: Message[], newUserMessage: string, attachments: Attachment[] = []) => {
+    const buildConversationPrompt = async (messages: Message[], newUserMessage: string, attachments: Attachment[] = []) => {
     let prompt = '';
 
+    // Perform semantic search if we have processed documents
+    if (processedDocuments.length > 0 && newUserMessage.trim()) {
+      try {
+        const relevantChunks = await documentProcessor.searchDocuments(newUserMessage, 3);
+        
+        if (relevantChunks.length > 0) {
+          prompt += "Based on the documents you have access to, here are the most relevant sections:\n\n";
+          
+          relevantChunks.forEach((chunk, index) => {
+            prompt += `[Document Section ${index + 1} from "${chunk.documentId}"]:\n`;
+            prompt += chunk.content + '\n\n';
+          });
+          
+          prompt += "Using the above relevant document sections, please answer the following question:\n\n";
+        }
+      } catch (err) {
+        console.error('Semantic search failed:', err);
+      }
+    }
+
+    // Add file content for newly attached files
+    if (attachments.length > 0) {
+      prompt += "Newly attached files:\n\n";
+      attachments.forEach(attachment => {
+        prompt += `--- FILE: ${attachment.name} ---\n`;
+        const contentPreview = attachment.content.length > 1000 
+          ? attachment.content.substring(0, 1000) + '... [truncated]'
+          : attachment.content;
+        prompt += contentPreview + '\n\n';
+      });
+    }
+  
+    // // Add file content at the beginning with clear instructions
+    // if (attachments.length > 0) {
+    //   prompt += "I have attached the following files. Please analyze the content and respond to my question based on the file content:\n\n";
+      
+    //   attachments.forEach(attachment => {
+    //     prompt += `--- FILE: ${attachment.name} (${(attachment.size / 1024).toFixed(1)} KB) ---\n`;
+        
+    //     // For CSV files, format them better
+    //     if (attachment.name.toLowerCase().endsWith('.csv')) {
+    //       const lines = attachment.content.split('\n').slice(0, 10); // Show first 10 lines
+    //       prompt += "CSV Content (first 10 lines):\n";
+    //       prompt += lines.join('\n');
+    //       if (attachment.content.split('\n').length > 10) {
+    //         prompt += `\n... and ${attachment.content.split('\n').length - 10} more lines`;
+    //       }
+    //     } else {
+    //       // For other files, show the content (limit to first 2000 chars to avoid context overflow)
+    //       const contentPreview = attachment.content.length > 2000 
+    //         ? attachment.content.substring(0, 2000) + `\n... [Content truncated. Total: ${attachment.content.length} characters]`
+    //         : attachment.content;
+    //       prompt += contentPreview;
+    //     }
+    //     prompt += '\n\n';
+    //   });
+      
+    //   prompt += "Based on the above file content, please respond to this question:\n";
+    // }
+
+     // Rest of your existing prompt building logic...
+    const recentMessages = messages.slice(-4);
+  
+    // Build conversation history
     switch (chatTemplate) {
       case 'gemma':
-        // Gemma format
         messages.forEach(msg => {
           if (msg.role === 'user') {
             prompt += `<start_of_turn>user\n${msg.content}<end_of_turn>\n`;
@@ -392,9 +901,8 @@ export default function WllamaUI() {
         });
         prompt += `<start_of_turn>user\n${newUserMessage}<end_of_turn>\n<start_of_turn>model\n`;
         break;
-
+  
       case 'qwen':
-        // Qwen format
         messages.forEach(msg => {
           if (msg.role === 'user') {
             prompt += `<|im_start|>user\n${msg.content}<|im_end|>\n`;
@@ -404,9 +912,8 @@ export default function WllamaUI() {
         });
         prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
         break;
-
+  
       case 'llama':
-        // Llama 2/3 format
         messages.forEach(msg => {
           if (msg.role === 'user') {
             prompt += `[INST] ${msg.content} [/INST]\n`;
@@ -416,16 +923,15 @@ export default function WllamaUI() {
         });
         prompt += `[INST] ${newUserMessage} [/INST]\n`;
         break;
-
+  
       case 'chatml':
-        // ChatML format (used by many models)
         messages.forEach(msg => {
           prompt += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
         });
         prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
         break;
     }
-
+  
     return prompt;
   };
 
@@ -434,27 +940,36 @@ export default function WllamaUI() {
       setError('Please load a model first');
       return;
     }
-
-    if (!input.trim()) {
+  
+    if (!input.trim() && attachedFiles.length === 0) {
+      setError('Please enter a message or attach files');
       return;
     }
-
+  
     if (!currentConversationId) {
       createNewConversation();
       return;
     }
-
-    const userMessage = input.trim();
+  
+    const userMessage = input.trim() || 
+      (attachedFiles.length > 0 
+        ? `Please analyze the content of the attached file${attachedFiles.length > 1 ? 's' : ''} and provide a summary or answer questions about it.` 
+        : '');
+    
     setInput('');
     setIsGenerating(true);
     setError('');
-
+  
+    // Process attachments first
+    const attachments = await processAttachedFiles();
+  
     const newUserMessage: Message = {
       role: 'user',
       content: userMessage,
-      timestamp: new Date()
+      timestamp: new Date(),
+      attachments: attachments.length > 0 ? attachments : undefined
     };
-
+  
     // Add user message first
     setConversations(prev => prev.map(conv => {
       if (conv.id === currentConversationId) {
@@ -467,17 +982,29 @@ export default function WllamaUI() {
       }
       return conv;
     }));
-
+  
     if (messages.length === 0) {
-      updateConversationTitle(currentConversationId, userMessage);
+      updateConversationTitle(currentConversationId, userMessage || `Chat with ${attachments.length} file${attachments.length > 1 ? 's' : ''}`);
     }
-
+  
+    // Clear attached files after processing
+    setAttachedFiles([]);
+  
+    // SINGLE TRY BLOCK - removed the nested one
     try {
-      const formattedPrompt = buildConversationPrompt(messages, userMessage);
-
+      // Use the current messages (including the one we just added)
+      const currentConv = conversations.find(c => c.id === currentConversationId);
+      const messagesForPrompt = currentConv ? [...currentConv.messages, newUserMessage] : [newUserMessage];
+      
+      const formattedPrompt = await buildConversationPrompt(
+        messagesForPrompt.slice(0, -1), // All messages except the current one
+        userMessage, 
+        attachments
+      );
+  
       // Get the index for the assistant's message
-      const assistantMessageIndex = messages.length + 1; // +1 because we just added user message
-
+      const assistantMessageIndex = messages.length + 1;
+  
       // Add placeholder for assistant response
       setConversations(prev => prev.map(conv => {
         if (conv.id === currentConversationId) {
@@ -493,13 +1020,13 @@ export default function WllamaUI() {
         }
         return conv;
       }));
-
+  
       let fullContent = '';
       let displayContent = '';
-
+  
       // Use onNewToken callback for streaming
       await wllamaRef.current!.createCompletion(formattedPrompt, {
-        nPredict: 512,
+        nPredict: 1024, // Increase for longer responses with file content
         sampling: {
           temp: 0.7,
           top_k: 40,
@@ -509,17 +1036,17 @@ export default function WllamaUI() {
         },
         onNewToken: (token: number, piece: Uint8Array, currentText: string) => {
           fullContent = currentText;
-
+  
           // Remove thinking blocks in real-time
           displayContent = currentText
             .replace(/<think>[\s\S]*?<\/think>/gi, '')
-            .replace(/<think>[\s\S]*$/gi, '') // Handle incomplete think blocks
+            .replace(/<think>[\s\S]*$/gi, '')
             .replace(/<end_of_turn>/g, '')
             .replace(/<\|im_end\|>/g, '')
             .replace(/\[INST\]/g, '')
             .replace(/\[\/INST\]/g, '')
             .trim();
-
+  
           // Update the message in real-time
           setConversations(prev => prev.map(conv => {
             if (conv.id === currentConversationId) {
@@ -537,7 +1064,7 @@ export default function WllamaUI() {
           }));
         }
       });
-
+  
       // Final cleanup
       const finalContent = fullContent
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
@@ -546,7 +1073,7 @@ export default function WllamaUI() {
         .replace(/\[INST\]/g, '')
         .replace(/\[\/INST\]/g, '')
         .trim();
-
+  
       // Update with final cleaned content
       setConversations(prev => prev.map(conv => {
         if (conv.id === currentConversationId) {
@@ -562,10 +1089,10 @@ export default function WllamaUI() {
         }
         return conv;
       }));
-
+  
     } catch (err: any) {
       setError('Failed to generate response: ' + (err?.message || String(err)));
-      console.error(err);
+      console.error('Generation error:', err);
     } finally {
       setIsGenerating(false);
       inputRef.current?.focus();
@@ -582,9 +1109,16 @@ export default function WllamaUI() {
   const exportChat = () => {
     if (!currentConversation) return;
 
-    const chatText = currentConversation.messages.map(msg =>
-      `[${msg.timestamp.toLocaleString()}] ${msg.role.toUpperCase()}: ${msg.content}`
-    ).join('\n\n');
+    const chatText = currentConversation.messages.map(msg => {
+      let messageText = `[${msg.timestamp.toLocaleString()}] ${msg.role.toUpperCase()}: ${msg.content}`;
+      if (msg.attachments && msg.attachments.length > 0) {
+        messageText += `\nAttachments: ${msg.attachments.map(a => a.name).join(', ')}`;
+        msg.attachments.forEach(attachment => {
+          messageText += `\n--- ${attachment.name} ---\n${attachment.content}\n`;
+        });
+      }
+      return messageText;
+    }).join('\n\n');
 
     const blob = new Blob([chatText], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -809,75 +1343,63 @@ export default function WllamaUI() {
                 </div>
               )}
 
-              {/* Context Size Setting */}
-              <div className="mb-6 bg-white/5 border border-white/10 rounded-lg p-4">
-                <label className="block text-purple-200 text-sm mb-2">
-                  Context Size: {nCtx}
-                </label>
-                <input
-                  type="range"
-                  min="128"
-                  max="8192"
-                  step="128"
-                  value={nCtx}
-                  onChange={(e) => setNCtx(Number(e.target.value))}
-                  className="w-full"
-                />
-              </div>
-
-              {/* Chat Template Selection */}
-              <div className="mb-6 bg-white/5 border border-white/10 rounded-lg p-4">
-                <label className="block text-white font-semibold mb-3">
-                  Chat Template
-                </label>
-                <select
-                  value={chatTemplate}
-                  onChange={(e) => setChatTemplate(e.target.value as any)}
-                  className="w-full bg-white/10 border border-white/20 text-white rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                >
-                  <option value="gemma">Gemma (Google)</option>
-                  <option value="qwen">Qwen (Alibaba)</option>
-                  <option value="llama">Llama 2/3 (Meta)</option>
-                  <option value="chatml">ChatML (General)</option>
-                </select>
-                <p className="text-purple-300 text-xs mt-2">
-                  Choose the template matching your model&lsquo;s training format
-                </p>
-              </div>
-
-              {/* Cached Models List */}
-              <div>
-                <h3 className="text-white font-semibold mb-3">Cached Models ({cachedModels.length})</h3>
-                <div className="space-y-2">
-                  {cachedModels.length === 0 ? (
-                    <p className="text-purple-300 text-sm">No models cached yet</p>
-                  ) : (
-                    cachedModels.map((model) => (
+              {/* Cached Models */}
+              <div className="mt-8">
+                <h3 className="text-white font-semibold mb-3">Cached Models</h3>
+                {cachedModels.length === 0 ? (
+                  <p className="text-gray-400 text-sm">No cached models found.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {cachedModels.map((model) => (
                       <div
                         key={model.url}
-                        className="bg-white/5 border border-white/10 rounded-lg p-4 flex items-center justify-between"
+                        className="flex items-center justify-between p-3 bg-white/5 rounded-lg border border-white/10"
                       >
-                        <div className="flex-1">
-                          <p className="text-white font-medium">{model.name}</p>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-white text-sm truncate">{model.name}</p>
                           <p className="text-purple-300 text-xs">
-                            Size: {(model.size / 1024 / 1024).toFixed(1)} MB
+                            {(model.size / 1024 / 1024).toFixed(1)} MB
                           </p>
                         </div>
-                        <div className="flex gap-2">
-                          <button
-                            onClick={() => loadModelFromUrl(model.url)}
-                            disabled={isLoading}
-                            className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white px-4 py-2 rounded-lg text-sm"
-                          >
-                            Load
-                          </button>
-                          <button
-                            onClick={() => deleteCachedModel(model.url)}
-                            className="bg-red-600 hover:bg-red-700 text-white p-2 rounded-lg"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                        <button
+                          onClick={() => deleteCachedModel(model.url)}
+                          className="text-red-400 hover:text-red-300 p-1 transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Processed Documents Section - THIS IS CORRECTLY PLACED */}
+              <div className="mt-8">
+                <h3 className="text-white font-semibold mb-3">Processed Documents ({processedDocuments.length})</h3>
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {processedDocuments.length === 0 ? (
+                    <p className="text-purple-300 text-sm">No documents processed yet</p>
+                  ) : (
+                    processedDocuments.map((doc) => (
+                      <div
+                        key={doc.id}
+                        className="bg-white/5 border border-white/10 rounded-lg p-3 flex items-center justify-between"
+                      >
+                        <div className="flex-1">
+                          <p className="text-white text-sm font-medium">{doc.name}</p>
+                          <p className="text-purple-300 text-xs">
+                            {doc.chunks.length} chunks • {(doc.size / 1024).toFixed(1)} KB
+                          </p>
                         </div>
+                        <button
+                          onClick={() => {
+                            documentProcessor.deleteDocument(doc.id);
+                            setProcessedDocuments(prev => prev.filter(d => d.id !== doc.id));
+                          }}
+                          className="text-red-400 hover:text-red-300 p-1 transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
                       </div>
                     ))
                   )}
@@ -888,155 +1410,213 @@ export default function WllamaUI() {
         </div>
       )}
 
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col h-screen">
+      {/* Main Chat Area */}
+      <div className="flex-1 flex flex-col">
         {/* Header */}
-        <div className="bg-white/10 backdrop-blur-lg border-b border-white/20 p-4">
-          <div className="flex items-center gap-3">
+        <header className="bg-slate-900/50 backdrop-blur-lg border-b border-white/10 p-4 flex items-center justify-between">
+          <div className="flex items-center gap-4">
             <button
               onClick={() => setSidebarOpen(!sidebarOpen)}
               className="text-white hover:bg-white/10 p-2 rounded-lg transition-colors"
             >
               {sidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
             </button>
-            <div className="flex-1">
-              <h1 className="text-2xl font-bold text-white">
-                {currentConversation?.title || 'Wllama Chatbot'}
-              </h1>
-              <p className="text-purple-200 text-sm">
-                {wllamaRef.current ? 'Model loaded - Ready to chat' : 'Load a model to start'}
-              </p>
-            </div>
+            <h1 className="text-white font-bold text-xl">Wllama Chat</h1>
           </div>
-        </div>
 
-        {/* Status Messages */}
-        {status && (
-          <div className="bg-blue-500/20 border-b border-blue-400/50 text-blue-100 px-6 py-3">
-            {status}
-          </div>
-        )}
-
-        {error && (
-          <div className="bg-red-500/20 border-b border-red-400/50 text-red-100 px-6 py-3">
-            {error}
-          </div>
-        )}
-
-        {/* Chat Messages Area */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
-          {messages.length === 0 && wllamaRef.current && (
-            <div className="text-center text-purple-300 py-12">
-              <Bot className="w-16 h-16 mx-auto mb-4 opacity-50" />
-              <p className="text-lg">Start a conversation!</p>
-              <p className="text-sm mt-2">Type a message below to begin chatting.</p>
-            </div>
-          )}
-
-          {!wllamaRef.current && (
-            <div className="text-center text-purple-300 py-12">
-              <HardDrive className="w-16 h-16 mx-auto mb-4 opacity-50" />
-              <p className="text-lg">No model loaded</p>
-              <p className="text-sm mt-2 mb-4">Click &quot;Manage models&quot; to get started</p>
+          <div className="flex items-center gap-3">
+            {status && (
+              <div className="text-purple-300 text-sm flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                {status}
+              </div>
+            )}
+            {currentConversation && (
               <button
-                onClick={() => setShowModelManager(true)}
-                className="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-6 rounded-lg transition-colors"
+                onClick={exportChat}
+                className="text-white hover:bg-white/10 p-2 rounded-lg transition-colors"
+                title="Export chat"
               >
-                Open Model Manager
+                <Save className="w-5 h-5" />
               </button>
+            )}
+          </div>
+        </header>
+
+        {/* Chat Messages */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+          {!wllamaRef.current ? (
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center text-white max-w-md">
+                <HardDrive className="w-16 h-16 mx-auto mb-4 text-purple-400" />
+                <h3 className="text-xl font-bold mb-2">No Model Loaded</h3>
+                <p className="text-purple-200 mb-4">
+                  Please load a model to start chatting. You can download from Hugging Face or load a local file.
+                </p>
+                <button
+                  onClick={() => setShowModelManager(true)}
+                  className="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-6 rounded-lg transition-colors"
+                >
+                  Load Model
+                </button>
+              </div>
             </div>
-          )}
-
-          {messages.map((message, index) => (
-            <div
-              key={index}
-              className={`flex gap-3 ${message.role === 'user' ? 'justify-end' : 'justify-start'
-                }`}
-            >
-              {message.role === 'assistant' && (
-                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-600 flex items-center justify-center">
-                  <Bot className="w-5 h-5 text-white" />
-                </div>
-              )}
-
-              <div
-                className={`max-w-[70%] rounded-2xl p-4 ${message.role === 'user'
-                  ? 'bg-purple-600 text-white'
-                  : 'bg-white/10 text-white border border-white/20'
-                  }`}
-              >
-                <p className="whitespace-pre-wrap break-words">{message.content}</p>
-                <p className="text-xs mt-2 opacity-60">
-                  {message.timestamp.toLocaleTimeString()}
+          ) : messages.length === 0 ? (
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center text-white max-w-md">
+                <MessageSquare className="w-16 h-16 mx-auto mb-4 text-purple-400" />
+                <h3 className="text-xl font-bold mb-2">Start a Conversation</h3>
+                <p className="text-purple-200">
+                  Send a message to begin chatting with your loaded model.
                 </p>
               </div>
-
-              {message.role === 'user' && (
-                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-pink-600 flex items-center justify-center">
-                  <User className="w-5 h-5 text-white" />
+            </div>
+          ) : (
+            messages.map((message, index) => (
+              <div
+                key={index}
+                className={`flex gap-4 ${message.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}
+              >
+                <div
+                  className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user'
+                    ? 'bg-purple-600'
+                    : 'bg-blue-600'
+                    }`}
+                >
+                  {message.role === 'user' ? (
+                    <User className="w-4 h-4 text-white" />
+                  ) : (
+                    <MessageCircle className="w-4 h-4 text-white" />
+                  )}
                 </div>
-              )}
-            </div>
-          ))}
-
-          {isGenerating && (
-            <div className="flex gap-3 justify-start">
-              <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-600 flex items-center justify-center">
-                <Bot className="w-5 h-5 text-white" />
+                <div
+                  className={`flex-1 max-w-3xl ${message.role === 'user' ? 'text-right' : 'text-left'}`}
+                >
+                  <div
+                    className={`inline-block rounded-2xl px-4 py-2 ${message.role === 'user'
+                      ? 'bg-purple-600 text-white'
+                      : 'bg-white/10 text-white'
+                      }`}
+                  >
+                    {/* Display attachments if any */}
+                    {message.attachments && message.attachments.length > 0 && (
+                      <div className="mb-3 p-2 bg-black/20 rounded-lg">
+                        <p className="text-xs opacity-75 mb-1">Attached files:</p>
+                        {message.attachments.map(attachment => (
+                          <div key={attachment.id} className="text-xs mb-1">
+                            <strong>{attachment.name}</strong> ({(attachment.size / 1024).toFixed(1)} KB)
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <p className="whitespace-pre-wrap">{message.content}</p>
+                  </div>
+                  <p className="text-purple-300 text-xs mt-1">
+                    {message.timestamp.toLocaleTimeString()}
+                  </p>
+                </div>
               </div>
-              <div className="bg-white/10 text-white border border-white/20 rounded-2xl p-4">
-                <Loader2 className="w-5 h-5 animate-spin" />
-              </div>
-            </div>
+            ))
           )}
-
           <div ref={messagesEndRef} />
         </div>
 
+        {/* File Attachments Preview */}
+        {attachedFiles.length > 0 && (
+          <div className="px-4 py-2 border-t border-white/10 bg-slate-800/50">
+            <div className="flex flex-wrap gap-2">
+              {attachedFiles.map((file, index) => (
+                <div
+                  key={index}
+                  className="flex items-center gap-2 bg-purple-600/30 border border-purple-500/50 rounded-lg px-3 py-2 text-sm text-white"
+                >
+                  <FileText className="w-4 h-4" />
+                  <span className="max-w-xs truncate">{file.name}</span>
+                  <button
+                    onClick={() => removeAttachedFile(index)}
+                    className="text-red-300 hover:text-red-200 transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Input Area */}
-        <div className="bg-white/10 backdrop-blur-lg border-t border-white/20 p-4">
-          <div className="max-w-4xl mx-auto">
-            <div className="flex gap-3 items-end">
+        <div className="border-t border-white/10 p-4 bg-slate-900/50 backdrop-blur-lg">
+          {error && (
+            <div className="mb-3 p-3 bg-red-500/20 border border-red-500/50 text-red-200 rounded-lg text-sm">
+              {error}
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            {/* File Upload Button */}
+            <input
+              ref={documentInputRef}
+              type="file"
+              accept=".pdf,.csv,.doc,.docx,.txt"
+              multiple
+              onChange={handleDocumentSelect}
+              className="hidden"
+            />
+            <button
+              onClick={() => documentInputRef.current?.click()}
+              disabled={isProcessingFiles || isGenerating}
+              className="flex-shrink-0 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white p-3 rounded-lg transition-colors"
+              title="Attach PDF, CSV, DOC, DOCX, or TXT files"
+            >
+              <FileText className="w-5 h-5" />
+            </button>
+
+            {/* Chat Template Selector */}
+            <select
+              value={chatTemplate}
+              onChange={(e) => setChatTemplate(e.target.value as any)}
+              className="flex-shrink-0 bg-white/10 border border-white/20 text-white rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+            >
+              <option value="gemma">Gemma</option>
+              <option value="qwen">Qwen</option>
+              <option value="llama">Llama</option>
+              <option value="chatml">ChatML</option>
+            </select>
+
+            <div className="flex-1 relative">
               <textarea
                 ref={inputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyPress}
-                placeholder={wllamaRef.current ? "Type your message... (Shift+Enter for new line)" : "Load a model first..."}
-                disabled={!wllamaRef.current || isGenerating}
-                className="flex-1 bg-white/10 border border-white/20 text-white placeholder-gray-400 rounded-lg p-3 min-h-[60px] max-h-[200px] focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none disabled:opacity-50"
-                rows={2}
+                onKeyPress={handleKeyPress}
+                placeholder={wllamaRef.current ? "Type your message... (Shift+Enter for new line)" : "Load a model to start chatting..."}
+                disabled={!wllamaRef.current || isGenerating || isProcessingFiles}
+                className="w-full bg-white/10 border border-white/20 text-white placeholder-gray-400 rounded-lg p-3 pr-12 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 resize-none"
+                rows={1}
+                style={{ minHeight: '3rem', maxHeight: '12rem' }}
               />
-              <button
-                onClick={sendMessage}
-                disabled={!wllamaRef.current || isGenerating || !input.trim()}
-                className="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 disabled:from-gray-600 disabled:to-gray-600 disabled:cursor-not-allowed text-white font-bold p-4 rounded-lg transition-all flex items-center justify-center shadow-lg"
-              >
+            </div>
+
+            <button
+              onClick={sendMessage}
+              disabled={!wllamaRef.current || isGenerating || isProcessingFiles || (!input.trim() && attachedFiles.length === 0)}
+              className="flex-shrink-0 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white p-3 rounded-lg transition-colors"
+            >
+              {isGenerating ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : (
                 <Send className="w-5 h-5" />
-              </button>
-              {messages.length > 0 && (
-                <button
-                  onClick={exportChat}
-                  disabled={isGenerating}
-                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-bold p-4 rounded-lg transition-all flex items-center justify-center"
-                  title="Export chat"
-                >
-                  <Download className="w-5 h-5" />
-                </button>
               )}
-            </div>
-            <div className="flex items-center justify-between mt-2">
-              <p className="text-xs text-purple-300">
-                Press Enter to send &bull; Shift+Enter for new line
-              </p>
-              {conversations.length > 0 && (
-                <p className="text-xs text-green-300 flex items-center gap-1">
-                  <Save className="w-3 h-3" />
-                  Auto-saved
-                </p>
-              )}
-            </div>
+            </button>
           </div>
+
+          {/* Processing indicator */}
+          {isProcessingFiles && (
+            <div className="mt-2 flex items-center gap-2 text-purple-300 text-sm">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Processing {attachedFiles.length} file(s)...
+            </div>
+          )}
         </div>
       </div>
     </div>
