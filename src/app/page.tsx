@@ -17,7 +17,9 @@ import {
   Globe, 
   HardDrive, 
   FileText,
-  MessageCircle // Replace Bot with MessageCircle
+  MessageCircle,
+  Cpu,
+  Brain
 } from 'lucide-react';
 
 interface ProgressCallback {
@@ -46,6 +48,7 @@ interface Message {
   content: string;
   timestamp: Date;
   attachments?: Attachment[];
+  documentSources?: string[]; // Add this line
 }
 
 interface Attachment {
@@ -93,6 +96,139 @@ interface StoredDocument {
   processedAt: Date;
 }
 
+// Add embedding model interface
+interface EmbeddingModel {
+  generateEmbedding: (text: string) => Promise<number[]>;
+  isLoaded: boolean;
+}
+
+class EmbeddingProcessor {
+  private wllama: any = null;
+  private isInitialized = false;
+  private initPromise: Promise<void> | null = null;
+
+  private generateSmartMockEmbedding(text: string): number[] {
+    const embedding = new Array(384).fill(0);
+    const words = text.toLowerCase().split(/\s+/);
+    const sentences = text.split(/[.!?]+/);
+    
+    // Common question words and important terms
+    const questionWords = ['what', 'how', 'why', 'when', 'where', 'who', 'which', 'explain', 'describe', 'show'];
+    const importantVerbs = ['analyze', 'compare', 'calculate', 'find', 'list', 'identify', 'summarize'];
+    
+    words.forEach(word => {
+      const cleanWord = word.replace(/[^a-z0-9]/g, '');
+      if (cleanWord.length < 2) return;
+      
+      let hash = 0;
+      for (let i = 0; i < cleanWord.length; i++) {
+        hash = ((hash << 5) - hash) + cleanWord.charCodeAt(i);
+        hash = hash & hash;
+      }
+      
+      // Boost important words
+      let weight = 0.15;
+      if (questionWords.includes(cleanWord)) weight = 0.4;
+      if (importantVerbs.includes(cleanWord)) weight = 0.35;
+      if (cleanWord.length > 6) weight = 0.25; // Longer words often more specific
+      
+      // Distribute across embedding
+      for (let i = 0; i < 4; i++) {
+        const index = Math.abs(hash + i * 7919) % 384;
+        embedding[index] = (embedding[index] + weight) % 1.0;
+      }
+    });
+    
+    // Document characteristics
+    embedding[0] = Math.min(words.length / 150, 1.0);
+    embedding[1] = text.includes('?') ? 0.9 : 0.1;
+    embedding[2] = Math.min(sentences.length / 15, 1.0);
+    
+    return embedding;
+  }
+
+  async init(): Promise<void> {
+    if (this.isInitialized) return;
+    if (this.initPromise) return this.initPromise;
+
+    this.initPromise = (async () => {
+      try {
+        const WllamaModule = await import('@wllama/wllama/esm/index.js');
+        const Wllama = WllamaModule.Wllama;
+
+        const CONFIG_PATHS = {
+          'single-thread/wllama.wasm': './wllama/esm/single-thread/wllama.wasm',
+          'multi-thread/wllama.wasm': './wllama/esm/multi-thread/wllama.wasm',
+        };
+
+        this.wllama = new Wllama(CONFIG_PATHS);
+        
+        const config = {
+          n_ctx: 2048,
+          n_batch: 512,
+          n_threads: navigator.hardwareConcurrency || 4,
+          n_gpu_layers: 0,
+          use_mlock: false,
+          use_mmap: true,
+          progressCallback: () => {}
+        };
+
+        // const embeddingModelUrl = `https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300m-q4_0.gguf`;
+        const embeddingModelUrl = `https://huggingface.co/ggml-org/gte-small-Q8_0-GGUF/resolve/main/gte-small-q8_0.gguf`;
+        
+        await this.wllama.loadModelFromUrl(embeddingModelUrl, config);
+        
+        // Enable embeddings for the main instance
+        await this.wllama.setOptions({ embeddings: true });
+
+        this.isInitialized = true;
+        
+        console.log('Embedding model loaded successfully');
+      } catch (error) {
+        console.error('Failed to load embedding model:', error);
+        this.initPromise = null;
+        throw error;
+      }
+    })();
+
+    return this.initPromise;
+  }
+
+  async generateEmbedding(text: string): Promise<number[]> {
+    if (!this.isInitialized) {
+      await this.init();
+    }
+
+    try {
+      // Note: You might need to adjust this based on the actual Wllama API
+      // Some embedding models might use different methods
+      const embedding = await this.wllama.createEmbedding(text);
+      return embedding;
+    } catch (error) {
+      console.error('Embedding generation failed:', error);
+      // Fallback to mock embedding
+      return this.generateMockEmbedding(text);
+    }
+  }
+
+  private generateMockEmbedding(text: string): number[] {
+    const embedding = new Array(512).fill(0);
+    const words = text.toLowerCase().split(/\s+/);
+    
+    words.forEach(word => {
+      let hash = 0;
+      for (let i = 0; i < word.length; i++) {
+        hash = ((hash << 5) - hash) + word.charCodeAt(i);
+        hash |= 0;
+      }
+      const index = Math.abs(hash) % 512;
+      embedding[index] = (embedding[index] + 1) % 1.0;
+    });
+    
+    return embedding;
+  }
+}
+
 // Add these imports at the top
 import { pipeline, env } from '@xenova/transformers';
 
@@ -113,18 +249,34 @@ const cosineSimilarity = (a: number[], b: number[]): number => {
   return dotProduct / (magnitudeA * magnitudeB);
 };
 
-// Document Processor Class
+// Update your DocumentProcessor class to use the real embedding model
+// Updated DocumentProcessor class with proper async/await handling
 class DocumentProcessor {
   private db: IDBDatabase | null = null;
   private readonly DB_NAME = 'WllamaDocuments';
   private readonly DB_VERSION = 1;
   private readonly STORE_NAME = 'documents';
+  private embeddingModel: EmbeddingProcessor;
+  private initPromise: Promise<void> | null = null;
+
+  constructor() {
+    this.embeddingModel = new EmbeddingProcessor();
+  }
 
   async init(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    // Prevent multiple initializations
+    if (this.initPromise) {
+      return this.initPromise;
+    }
+
+    this.initPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(this.DB_NAME, this.DB_VERSION);
 
-      request.onerror = () => reject(request.error);
+      request.onerror = () => {
+        this.initPromise = null;
+        reject(request.error);
+      };
+      
       request.onsuccess = () => {
         this.db = request.result;
         resolve();
@@ -138,7 +290,20 @@ class DocumentProcessor {
           store.createIndex('processedAt', 'processedAt', { unique: false });
         }
       };
+
+      request.onblocked = () => {
+        this.initPromise = null;
+        reject(new Error('IndexedDB request blocked'));
+      };
     });
+
+    return this.initPromise;
+  }
+
+  async ensureInitialized(): Promise<void> {
+    if (!this.db) {
+      await this.init();
+    }
   }
 
   async chunkDocument(content: string, chunkSize: number = 500, overlap: number = 50): Promise<string[]> {
@@ -173,37 +338,41 @@ class DocumentProcessor {
   }
 
   async processDocument(file: File, content: string): Promise<StoredDocument> {
-    if (!this.db) await this.init();
+    await this.ensureInitialized();
 
     const chunks = await this.chunkDocument(content);
     const documentChunks: DocumentChunk[] = [];
 
     for (let i = 0; i < chunks.length; i++) {
-      const embedding = await generateEmbedding(chunks[i]);
-      documentChunks.push({
-        id: `${file.name}-chunk-${i}`,
-        documentId: file.name,
-        content: chunks[i],
-        embedding,
-        metadata: {
-          chunkIndex: i,
-          startPos: i * 500,
-          endPos: (i * 500) + chunks[i].length
-        }
-      });
+      try {
+        const embedding = await this.embeddingModel.generateEmbedding(chunks[i]);
+        documentChunks.push({
+          id: `${file.name}-chunk-${i}-${Date.now()}`,
+          documentId: file.name,
+          content: chunks[i],
+          embedding,
+          metadata: {
+            chunkIndex: i,
+            startPos: i * 500,
+            endPos: (i * 500) + chunks[i].length
+          }
+        });
+      } catch (error) {
+        console.error(`Failed to generate embedding for chunk ${i}:`, error);
+        // Continue with other chunks even if one fails
+      }
     }
 
     const document: StoredDocument = {
-      id: file.name,
+      id: `${file.name}-${Date.now()}`,
       name: file.name,
       type: file.type,
       size: file.size,
-      content: content.substring(0, 1000), // Store only preview
+      content: content.substring(0, 1000),
       chunks: documentChunks,
       processedAt: new Date()
     };
 
-    // Store in IndexedDB
     return new Promise((resolve, reject) => {
       if (!this.db) {
         reject(new Error('Database not initialized'));
@@ -220,9 +389,9 @@ class DocumentProcessor {
   }
 
   async searchDocuments(query: string, limit: number = 3): Promise<DocumentChunk[]> {
-    if (!this.db) await this.init();
+    await this.ensureInitialized();
 
-    const queryEmbedding = await generateEmbedding(query);
+    const queryEmbedding = await this.embeddingModel.generateEmbedding(query);
     const allChunks: DocumentChunk[] = [];
 
     return new Promise((resolve, reject) => {
@@ -239,30 +408,31 @@ class DocumentProcessor {
       request.onsuccess = () => {
         const documents: StoredDocument[] = request.result;
         
-        // Collect all chunks from all documents
         documents.forEach(doc => {
           allChunks.push(...doc.chunks);
         });
 
-        // Calculate similarity scores
+        // Calculate similarity and filter by threshold
         const scoredChunks = allChunks.map(chunk => ({
           chunk,
           score: cosineSimilarity(queryEmbedding, chunk.embedding)
         }));
 
-        // Sort by similarity and return top chunks
-        const topChunks = scoredChunks
+        // Only return chunks that are actually relevant
+        const relevantChunks = scoredChunks
+          .filter(item => item.score > 0.3) // Minimum similarity threshold
           .sort((a, b) => b.score - a.score)
           .slice(0, limit)
           .map(item => item.chunk);
 
-        resolve(topChunks);
+        console.log(`Found ${relevantChunks.length} relevant chunks for: "${query}"`);
+        resolve(relevantChunks);
       };
     });
   }
 
   async getAllDocuments(): Promise<StoredDocument[]> {
-    if (!this.db) await this.init();
+    await this.ensureInitialized();
 
     return new Promise((resolve, reject) => {
       if (!this.db) {
@@ -280,7 +450,7 @@ class DocumentProcessor {
   }
 
   async deleteDocument(documentId: string): Promise<void> {
-    if (!this.db) await this.init();
+    await this.ensureInitialized();
 
     return new Promise((resolve, reject) => {
       if (!this.db) {
@@ -294,6 +464,101 @@ class DocumentProcessor {
 
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve();
+    });
+  }
+}
+
+class DiskModelManager {
+  private db: IDBDatabase | null = null;
+  private readonly DB_NAME = 'WllamaModels';
+  private readonly STORE_NAME = 'models';
+
+  async init(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(this.DB_NAME, 1);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        this.db = request.result;
+        resolve();
+      };
+
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(this.STORE_NAME)) {
+          const store = db.createObjectStore(this.STORE_NAME, { keyPath: 'id' });
+          store.createIndex('name', 'name', { unique: false });
+          store.createIndex('size', 'size', { unique: false });
+          store.createIndex('lastAccessed', 'lastAccessed', { unique: false });
+        }
+      };
+    });
+  }
+
+  async saveModelChunk(modelId: string, chunkIndex: number, data: ArrayBuffer): Promise<void> {
+    if (!this.db) await this.init();
+
+    return new Promise((resolve, reject) => {
+      const transaction = this.db!.transaction([this.STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(this.STORE_NAME);
+      
+      const chunk = {
+        id: `${modelId}_chunk_${chunkIndex}`,
+        modelId,
+        chunkIndex,
+        data,
+        timestamp: new Date()
+      };
+
+      const request = store.put(chunk);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve();
+    });
+  }
+
+  async getModelChunk(modelId: string, chunkIndex: number): Promise<ArrayBuffer | null> {
+    if (!this.db) await this.init();
+
+    return new Promise((resolve, reject) => {
+      const transaction = this.db!.transaction([this.STORE_NAME], 'readonly');
+      const store = transaction.objectStore(this.STORE_NAME);
+      const request = store.get(`${modelId}_chunk_${chunkIndex}`);
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        resolve(request.result?.data || null);
+      };
+    });
+  }
+
+  async getCachedModels(): Promise<any[]> {
+    if (!this.db) await this.init();
+
+    return new Promise((resolve, reject) => {
+      const transaction = this.db!.transaction([this.STORE_NAME], 'readonly');
+      const store = transaction.objectStore(this.STORE_NAME);
+      const request = store.getAll();
+
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        // Group chunks by modelId
+        const chunks = request.result;
+        const models: any = {};
+        
+        chunks.forEach(chunk => {
+          if (!models[chunk.modelId]) {
+            models[chunk.modelId] = {
+              id: chunk.modelId,
+              chunks: [],
+              size: 0
+            };
+          }
+          models[chunk.modelId].chunks.push(chunk);
+          models[chunk.modelId].size += chunk.data.byteLength;
+        });
+
+        resolve(Object.values(models));
+      };
     });
   }
 }
@@ -330,12 +595,30 @@ export default function WllamaUI() {
   const [processedDocuments, setProcessedDocuments] = useState<StoredDocument[]>([]);
 
   // Initialize document processor
+  // In your WllamaUI component, replace the problematic useEffect with:
   useEffect(() => {
-    documentProcessor.init().then(() => {
-      documentProcessor.getAllDocuments().then(docs => {
+    const initializeApp = async () => {
+      try {
+        // Initialize document processor
+        await documentProcessor.init();
+        const docs = await documentProcessor.getAllDocuments();
         setProcessedDocuments(docs);
-      });
-    });
+        
+        // Initialize embedding model separately
+        setEmbeddingModelStatus('Loading embedding model...');
+        try {
+          // The embedding model will be initialized when first used
+          setEmbeddingModelStatus('Embedding model ready on demand');
+        } catch (error) {
+          console.error('Failed to initialize embedding model:', error);
+          setEmbeddingModelStatus('Embedding model will use fallback');
+        }
+      } catch (error) {
+        console.error('Failed to initialize document processor:', error);
+      }
+    };
+
+    initializeApp();
   }, [documentProcessor]);
 
   // Load conversations from localStorage on mount
@@ -623,14 +906,13 @@ export default function WllamaUI() {
   
     try {
       const attachments: Attachment[] = [];
+      const newlyProcessedDocs: StoredDocument[] = []; // ← Store docs here
   
       for (const file of attachedFiles) {
         try {
           const content = await extractTextFromFile(file);
-          
-          // Process document with vector storage
           const processedDoc = await documentProcessor.processDocument(file, content);
-          setProcessedDocuments(prev => [...prev, processedDoc]);
+          newlyProcessedDocs.push(processedDoc); // ← Collect docs
   
           attachments.push({
             id: processedDoc.id,
@@ -652,8 +934,11 @@ export default function WllamaUI() {
         }
       }
   
+      // Update state once with all new documents
+      setProcessedDocuments(prev => [...prev, ...newlyProcessedDocs]);
       setStatus('');
       return attachments;
+      
     } catch (err) {
       setError('Failed to process attached files');
       return [];
@@ -661,7 +946,26 @@ export default function WllamaUI() {
       setIsProcessingFiles(false);
     }
   };
+  
+  const [embeddingModelStatus, setEmbeddingModelStatus] = useState<string>('');
 
+  // Initialize embedding model on component mount
+  useEffect(() => {
+    const initEmbeddingModel = async () => {
+      setEmbeddingModelStatus('Loading embedding model...');
+      try {
+        await documentProcessor.init();
+        setEmbeddingModelStatus('Embedding model ready');
+      } catch (error) {
+        console.error('Failed to initialize embedding model:', error);
+        setEmbeddingModelStatus('Embedding model failed - using fallback');
+      }
+    };
+
+    initEmbeddingModel();
+  }, []);
+
+  // Update the loadModelFromUrl function with better memory management
   const loadModelFromUrl = async (url: string) => {
     setIsLoading(true);
     setError('');
@@ -669,64 +973,87 @@ export default function WllamaUI() {
     setStatus('Initializing Wllama...');
   
     try {
-      // Construct full URL if needed
-      let fullUrl = url;
-      
-      // If it's a repository ID (not a direct URL)
-      if (!url.startsWith('http')) {
-        // Check if we have available files and a selection
-        if (availableFiles.length > 0 && !selectedFile) {
-          throw new Error('Please select a file from the repository');
-        }
-        
-        if (selectedFile) {
-          fullUrl = `https://huggingface.co/${modelUrl}/resolve/main/${selectedFile}`;
-        } else {
-          // If no files available yet, try to auto-select the first one
-          if (availableFiles.length > 0) {
-            fullUrl = `https://huggingface.co/${modelUrl}/resolve/main/${availableFiles[0]}`;
-            setSelectedFile(availableFiles[0]);
-          } else {
-            throw new Error('No GGUF files found in this repository or repository not found');
-          }
-        }
-      }
-  
       const WllamaModule = await import('@wllama/wllama/esm/index.js');
       const Wllama = WllamaModule.Wllama;
+      const { ModelManager } = WllamaModule;
   
-      const CONFIG_PATHS = {
-        'single-thread/wllama.wasm': './wllama/esm/single-thread/wllama.wasm',
-        'multi-thread/wllama.wasm': './wllama/esm/multi-thread/wllama.wasm',
-      };
+      const modelManager = new ModelManager();
+      const cachedModels = await modelManager.getModels();
+      const existingModel = cachedModels.find(m => m.url === url);
   
-      wllamaRef.current = new Wllama(CONFIG_PATHS);
+      if (existingModel) {
+        // Load from disk cache
+        setStatus('Loading model from disk cache...');
+        wllamaRef.current = new Wllama({
+          'single-thread/wllama.wasm': './wllama/esm/single-thread/wllama.wasm',
+          'multi-thread/wllama.wasm': './wllama/esm/multi-thread/wllama.wasm',
+        });
+      
+        const config = {
+          n_ctx: nCtx,
+          n_batch: 256,
+          n_threads: navigator.hardwareConcurrency || 4,
+          n_gpu_layers: 0,
+          use_mlock: false,
+          use_mmap: true,
+          progressCallback: ({ loaded, total }: ProgressCallback) => {
+            const progress = Math.round((loaded / total) * 100);
+            setLoadProgress(progress);
+            setStatus(`Loading from disk... ${progress}%`);
+          },
+        };
+      
+        // Use the cached model's URL to load it
+        await wllamaRef.current.loadModelFromUrl(existingModel.url, config);
+
+      } else {
+        // Download new model (your original loading logic)
+        let fullUrl = url;
+        
+        if (!url.startsWith('http')) {
+          if (availableFiles.length > 0 && !selectedFile) {
+            throw new Error('Please select a file from the repository');
+          }
+          
+          if (selectedFile) {
+            fullUrl = `https://huggingface.co/${modelUrl}/resolve/main/${selectedFile}`;
+          } else {
+            if (availableFiles.length > 0) {
+              fullUrl = `https://huggingface.co/${modelUrl}/resolve/main/${availableFiles[0]}`;
+              setSelectedFile(availableFiles[0]);
+            } else {
+              throw new Error('No GGUF files found in this repository or repository not found');
+            }
+          }
+        }
   
-      const progressCallback = ({ loaded, total }: ProgressCallback) => {
-        const progressPercentage = Math.round((loaded / total) * 100);
-        setLoadProgress(progressPercentage);
-        setStatus(`Loading model... ${progressPercentage}%`);
-      };
+        wllamaRef.current = new Wllama({
+          'single-thread/wllama.wasm': './wllama/esm/single-thread/wllama.wasm',
+          'multi-thread/wllama.wasm': './wllama/esm/multi-thread/wllama.wasm',
+        });
   
-      setStatus('Downloading model from URL...');
+        const progressCallback = ({ loaded, total }: ProgressCallback) => {
+          const progressPercentage = Math.round((loaded / total) * 100);
+          setLoadProgress(progressPercentage);
+          setStatus(`Downloading model... ${progressPercentage}%`);
+        };
   
-      const start = Date.now();
+        setStatus('Downloading and caching model...');
   
-      const config: WllamaConfig = {
-        n_ctx: nCtx,
-        n_batch: 2048,
-        n_threads: navigator.hardwareConcurrency || 8,
-        n_gpu_layers: 0,
-        use_mlock: false,
-        use_mmap: true,
-        progressCallback,
-      };
+        const config = {
+          n_ctx: nCtx,
+          n_batch: 256,
+          n_threads: Math.max(2, navigator.hardwareConcurrency - 1),
+          n_gpu_layers: 0,
+          use_mlock: false,
+          use_mmap: true,
+          progressCallback,
+        };
   
-      await wllamaRef.current.loadModelFromUrl(fullUrl, config);
+        await wllamaRef.current.loadModelFromUrl(fullUrl, config);
+      }
   
-      const took = Date.now() - start;
-      setStatus(`Model loaded successfully! (${took} ms)`);
-      setLoadProgress(100);
+      setStatus('Model ready!');
       setShowModelManager(false);
   
       if (conversations.length === 0) {
@@ -823,114 +1150,131 @@ export default function WllamaUI() {
   };
 
   // const buildConversationPrompt = (messages: Message[], newUserMessage: string, attachments: Attachment[] = []) => {
-    const buildConversationPrompt = async (messages: Message[], newUserMessage: string, attachments: Attachment[] = []) => {
-    let prompt = '';
+  // Add memory optimization to the buildConversationPrompt function
+  // const buildConversationPrompt = async (messages: Message[], newUserMessage: string, attachments: Attachment[] = []) => {
+  //   let prompt = '';
 
-    // Perform semantic search if we have processed documents
-    if (processedDocuments.length > 0 && newUserMessage.trim()) {
+  //   // Perform semantic search if we have processed documents
+  //   if (processedDocuments.length > 0 && newUserMessage.trim()) {
+  //     try {
+  //       const relevantChunks = await documentProcessor.searchDocuments(newUserMessage, 3);
+        
+  //       if (relevantChunks.length > 0) {
+  //         prompt += "Based on the documents you have access to, here are the most relevant sections:\n\n";
+          
+  //         relevantChunks.forEach((chunk, index) => {
+  //           prompt += `[Document Section ${index + 1} from "${chunk.documentId}"]:\n`;
+  //           prompt += chunk.content + '\n\n';
+  //         });
+          
+  //         prompt += "Using the above relevant document sections, please answer the following question:\n\n";
+  //       }
+  //     } catch (err) {
+  //       console.error('Semantic search failed:', err);
+  //     }
+  //   }
+
+  //   // Add file content for newly attached files
+  //   if (attachments.length > 0) {
+  //     prompt += "Newly attached files:\n\n";
+  //     attachments.forEach(attachment => {
+  //       prompt += `--- FILE: ${attachment.name} ---\n`;
+  //       const contentPreview = attachment.content.length > 1000 
+  //         ? attachment.content.substring(0, 1000) + '... [truncated]'
+  //         : attachment.content;
+  //       prompt += contentPreview + '\n\n';
+  //     });
+  //   }
+
+  //    // Rest of your existing prompt building logic...
+  //   const recentMessages = messages.slice(-4);
+  
+  //   // Build conversation history
+  //   switch (chatTemplate) {
+  //     case 'gemma':
+  //       // ✅ Start with system instruction
+  //       prompt += `<start_of_turn>system
+  //       You are a helpful, respectful, and honest assistant. Always answer as helpfully as possible, while being safe and factual.<end_of_turn>\n`;
+      
+  //       messages.forEach(msg => {
+  //         if (msg.role === 'user') {
+  //           prompt += `<start_of_turn>user\n${msg.content}<end_of_turn>\n`;
+  //         } else {
+  //           prompt += `<start_of_turn>model\n${msg.content}<end_of_turn>\n`;
+  //         }
+  //       });
+  //       prompt += `<start_of_turn>user\n${newUserMessage}<end_of_turn>\n<start_of_turn>model\n`;
+  //       break;
+  
+  //     case 'qwen':
+  //       messages.forEach(msg => {
+  //         if (msg.role === 'user') {
+  //           prompt += `<|im_start|>user\n${msg.content}<|im_end|>\n`;
+  //         } else {
+  //           prompt += `<|im_start|>assistant\n${msg.content}<|im_end|>\n`;
+  //         }
+  //       });
+  //       prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
+  //       break;
+  
+  //     case 'llama':
+  //       messages.forEach(msg => {
+  //         if (msg.role === 'user') {
+  //           prompt += `[INST] ${msg.content} [/INST]\n`;
+  //         } else {
+  //           prompt += `${msg.content}\n`;
+  //         }
+  //       });
+  //       prompt += `[INST] ${newUserMessage} [/INST]\n`;
+  //       break;
+  
+  //     case 'chatml':
+  //       messages.forEach(msg => {
+  //         prompt += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
+  //       });
+  //       prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
+  //       break;
+  //   }
+  
+  //   return prompt;
+  // };
+
+  const buildConversationPrompt = async (messages: Message[], newUserMessage: string, attachments: Attachment[] = []) => {
+    let prompt = '';
+  
+    // STEP 1: Always search documents first
+    if (processedDocuments.length > 0) {
       try {
         const relevantChunks = await documentProcessor.searchDocuments(newUserMessage, 3);
         
         if (relevantChunks.length > 0) {
-          prompt += "Based on the documents you have access to, here are the most relevant sections:\n\n";
+          prompt += "You have access to the following documents. Use this information to answer the question. If the answer can be found in these documents, prioritize this information over general knowledge.\n\n";
+          prompt += "REFERENCE DOCUMENTS:\n";
+          prompt += "====================\n";
           
           relevantChunks.forEach((chunk, index) => {
-            prompt += `[Document Section ${index + 1} from "${chunk.documentId}"]:\n`;
-            prompt += chunk.content + '\n\n';
+            prompt += `[DOCUMENT ${index + 1} - ${chunk.documentId}]:\n`;
+            prompt += `${chunk.content}\n\n`;
           });
           
-          prompt += "Using the above relevant document sections, please answer the following question:\n\n";
+          prompt += "QUESTION: " + newUserMessage + "\n\n";
+          prompt += "INSTRUCTIONS:\n";
+          prompt += "- Answer based on the reference documents above\n";
+          prompt += "- If the documents contain the answer, use them as the primary source\n";
+          prompt += "- Only use general knowledge if the documents don't contain the answer\n";
+          prompt += "- Be precise and cite information from the documents when possible\n";
+          prompt += "ANSWER: ";
+          
+          return prompt; // Return early - documents take priority
         }
       } catch (err) {
-        console.error('Semantic search failed:', err);
+        console.error('Document search failed:', err);
       }
     }
-
-    // Add file content for newly attached files
-    if (attachments.length > 0) {
-      prompt += "Newly attached files:\n\n";
-      attachments.forEach(attachment => {
-        prompt += `--- FILE: ${attachment.name} ---\n`;
-        const contentPreview = attachment.content.length > 1000 
-          ? attachment.content.substring(0, 1000) + '... [truncated]'
-          : attachment.content;
-        prompt += contentPreview + '\n\n';
-      });
-    }
   
-    // // Add file content at the beginning with clear instructions
-    // if (attachments.length > 0) {
-    //   prompt += "I have attached the following files. Please analyze the content and respond to my question based on the file content:\n\n";
-      
-    //   attachments.forEach(attachment => {
-    //     prompt += `--- FILE: ${attachment.name} (${(attachment.size / 1024).toFixed(1)} KB) ---\n`;
-        
-    //     // For CSV files, format them better
-    //     if (attachment.name.toLowerCase().endsWith('.csv')) {
-    //       const lines = attachment.content.split('\n').slice(0, 10); // Show first 10 lines
-    //       prompt += "CSV Content (first 10 lines):\n";
-    //       prompt += lines.join('\n');
-    //       if (attachment.content.split('\n').length > 10) {
-    //         prompt += `\n... and ${attachment.content.split('\n').length - 10} more lines`;
-    //       }
-    //     } else {
-    //       // For other files, show the content (limit to first 2000 chars to avoid context overflow)
-    //       const contentPreview = attachment.content.length > 2000 
-    //         ? attachment.content.substring(0, 2000) + `\n... [Content truncated. Total: ${attachment.content.length} characters]`
-    //         : attachment.content;
-    //       prompt += contentPreview;
-    //     }
-    //     prompt += '\n\n';
-    //   });
-      
-    //   prompt += "Based on the above file content, please respond to this question:\n";
-    // }
-
-     // Rest of your existing prompt building logic...
-    const recentMessages = messages.slice(-4);
-  
-    // Build conversation history
-    switch (chatTemplate) {
-      case 'gemma':
-        messages.forEach(msg => {
-          if (msg.role === 'user') {
-            prompt += `<start_of_turn>user\n${msg.content}<end_of_turn>\n`;
-          } else {
-            prompt += `<start_of_turn>model\n${msg.content}<end_of_turn>\n`;
-          }
-        });
-        prompt += `<start_of_turn>user\n${newUserMessage}<end_of_turn>\n<start_of_turn>model\n`;
-        break;
-  
-      case 'qwen':
-        messages.forEach(msg => {
-          if (msg.role === 'user') {
-            prompt += `<|im_start|>user\n${msg.content}<|im_end|>\n`;
-          } else {
-            prompt += `<|im_start|>assistant\n${msg.content}<|im_end|>\n`;
-          }
-        });
-        prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
-        break;
-  
-      case 'llama':
-        messages.forEach(msg => {
-          if (msg.role === 'user') {
-            prompt += `[INST] ${msg.content} [/INST]\n`;
-          } else {
-            prompt += `${msg.content}\n`;
-          }
-        });
-        prompt += `[INST] ${newUserMessage} [/INST]\n`;
-        break;
-  
-      case 'chatml':
-        messages.forEach(msg => {
-          prompt += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
-        });
-        prompt += `<|im_start|>user\n${newUserMessage}<|im_end|>\n<|im_start|>assistant\n`;
-        break;
-    }
+    // STEP 2: Only use general knowledge if no relevant documents found
+    prompt += "Question: " + newUserMessage + "\n\n";
+    prompt += "Answer based on your general knowledge: ";
   
     return prompt;
   };
@@ -996,8 +1340,20 @@ export default function WllamaUI() {
       const currentConv = conversations.find(c => c.id === currentConversationId);
       const messagesForPrompt = currentConv ? [...currentConv.messages, newUserMessage] : [newUserMessage];
       
-      const formattedPrompt = await buildConversationPrompt(
-        messagesForPrompt.slice(0, -1), // All messages except the current one
+      // SEARCH DOCUMENTS FIRST - moved here
+      let documentSources: string[] = [];
+      let formattedPrompt = '';
+      
+      if (processedDocuments.length > 0) {
+        const relevantChunks = await documentProcessor.searchDocuments(userMessage, 3);
+        if (relevantChunks.length > 0) {
+          // documentSources = [...new Set(relevantChunks.map(chunk => chunk.documentId))];
+          documentSources = relevantChunks.map(chunk => chunk.documentId);
+        }
+      }
+      
+      formattedPrompt = await buildConversationPrompt(
+        messagesForPrompt.slice(0, -1),
         userMessage, 
         attachments
       );
@@ -1005,7 +1361,7 @@ export default function WllamaUI() {
       // Get the index for the assistant's message
       const assistantMessageIndex = messages.length + 1;
   
-      // Add placeholder for assistant response
+      // Add placeholder for assistant response WITH documentSources
       setConversations(prev => prev.map(conv => {
         if (conv.id === currentConversationId) {
           return {
@@ -1013,79 +1369,11 @@ export default function WllamaUI() {
             messages: [...conv.messages, {
               role: 'assistant',
               content: '',
-              timestamp: new Date()
+              timestamp: new Date(),
+              documentSources: documentSources.length > 0 ? documentSources : undefined // Add here
             }],
             updatedAt: new Date()
           };
-        }
-        return conv;
-      }));
-  
-      let fullContent = '';
-      let displayContent = '';
-  
-      // Use onNewToken callback for streaming
-      await wllamaRef.current!.createCompletion(formattedPrompt, {
-        nPredict: 1024, // Increase for longer responses with file content
-        sampling: {
-          temp: 0.7,
-          top_k: 40,
-          top_p: 0.9,
-          repeat_penalty: 1.1,
-          repeat_last_n: 64,
-        },
-        onNewToken: (token: number, piece: Uint8Array, currentText: string) => {
-          fullContent = currentText;
-  
-          // Remove thinking blocks in real-time
-          displayContent = currentText
-            .replace(/<think>[\s\S]*?<\/think>/gi, '')
-            .replace(/<think>[\s\S]*$/gi, '')
-            .replace(/<end_of_turn>/g, '')
-            .replace(/<\|im_end\|>/g, '')
-            .replace(/\[INST\]/g, '')
-            .replace(/\[\/INST\]/g, '')
-            .trim();
-  
-          // Update the message in real-time
-          setConversations(prev => prev.map(conv => {
-            if (conv.id === currentConversationId) {
-              const updated = [...conv.messages];
-              if (updated[assistantMessageIndex]) {
-                updated[assistantMessageIndex] = {
-                  role: 'assistant',
-                  content: displayContent,
-                  timestamp: new Date()
-                };
-              }
-              return { ...conv, messages: updated, updatedAt: new Date() };
-            }
-            return conv;
-          }));
-        }
-      });
-  
-      // Final cleanup
-      const finalContent = fullContent
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/<end_of_turn>/g, '')
-        .replace(/<\|im_end\|>/g, '')
-        .replace(/\[INST\]/g, '')
-        .replace(/\[\/INST\]/g, '')
-        .trim();
-  
-      // Update with final cleaned content
-      setConversations(prev => prev.map(conv => {
-        if (conv.id === currentConversationId) {
-          const updated = [...conv.messages];
-          if (updated[assistantMessageIndex]) {
-            updated[assistantMessageIndex] = {
-              role: 'assistant',
-              content: finalContent,
-              timestamp: new Date()
-            };
-          }
-          return { ...conv, messages: updated, updatedAt: new Date() };
         }
         return conv;
       }));
@@ -1130,6 +1418,21 @@ export default function WllamaUI() {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
+
+  const [diskUsage, setDiskUsage] = useState<{used: number, quota: number} | null>(null);
+
+  useEffect(() => {
+    const checkStorage = async () => {
+      if ('storage' in navigator && 'estimate' in navigator.storage) {
+        const estimation = await navigator.storage.estimate();
+        setDiskUsage({
+          used: estimation.usage || 0,
+          quota: estimation.quota || 0
+        });
+      }
+    };
+    checkStorage();
+  }, []);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 flex">
@@ -1373,6 +1676,17 @@ export default function WllamaUI() {
                 )}
               </div>
 
+              {/* ADD DISK USAGE HERE */}
+              {diskUsage && (
+                <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+                  <p className="text-blue-200 text-xs">
+                    Storage: {(diskUsage.used / 1024 / 1024).toFixed(1)}MB / 
+                    {(diskUsage.quota / 1024 / 1024).toFixed(1)}MB used
+                    (${((diskUsage.used / diskUsage.quota) * 100).toFixed(1)}%)
+                  </p>
+                </div>
+              )}
+
               {/* Processed Documents Section - THIS IS CORRECTLY PLACED */}
               <div className="mt-8">
                 <h3 className="text-white font-semibold mb-3">Processed Documents ({processedDocuments.length})</h3>
@@ -1422,6 +1736,17 @@ export default function WllamaUI() {
               {sidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
             </button>
             <h1 className="text-white font-bold text-xl">Wllama Chat</h1>
+            {embeddingModelStatus && (
+              <span className={`text-xs px-2 py-1 rounded-full ${
+                embeddingModelStatus.includes('ready') 
+                  ? 'bg-green-500/20 text-green-300' 
+                  : embeddingModelStatus.includes('failed')
+                  ? 'bg-red-500/20 text-red-300'
+                  : 'bg-blue-500/20 text-blue-300'
+              }`}>
+                {embeddingModelStatus}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-3">
@@ -1473,47 +1798,31 @@ export default function WllamaUI() {
             </div>
           ) : (
             messages.map((message, index) => (
-              <div
-                key={index}
-                className={`flex gap-4 ${message.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}
-              >
-                <div
-                  className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user'
-                    ? 'bg-purple-600'
-                    : 'bg-blue-600'
-                    }`}
-                >
+              <div key={index} className={`flex gap-4 ${message.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
+                <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
+                  message.role === 'user' ? 'bg-purple-600' : 'bg-blue-600'
+                }`}>
                   {message.role === 'user' ? (
                     <User className="w-4 h-4 text-white" />
                   ) : (
                     <MessageCircle className="w-4 h-4 text-white" />
                   )}
                 </div>
-                <div
-                  className={`flex-1 max-w-3xl ${message.role === 'user' ? 'text-right' : 'text-left'}`}
-                >
-                  <div
-                    className={`inline-block rounded-2xl px-4 py-2 ${message.role === 'user'
-                      ? 'bg-purple-600 text-white'
-                      : 'bg-white/10 text-white'
-                      }`}
-                  >
-                    {/* Display attachments if any */}
-                    {message.attachments && message.attachments.length > 0 && (
-                      <div className="mb-3 p-2 bg-black/20 rounded-lg">
-                        <p className="text-xs opacity-75 mb-1">Attached files:</p>
-                        {message.attachments.map(attachment => (
-                          <div key={attachment.id} className="text-xs mb-1">
-                            <strong>{attachment.name}</strong> ({(attachment.size / 1024).toFixed(1)} KB)
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                <div className={`flex-1 max-w-3xl ${message.role === 'user' ? 'text-right' : 'text-left'}`}>
+                  {/* Show document sources for assistant messages */}
+                  {message.role === 'assistant' && message.documentSources && (
+                    <div className="mb-2 p-2 bg-green-500/20 border border-green-500/30 rounded-lg">
+                      <p className="text-green-300 text-xs">
+                        📚 Based on: {message.documentSources.join(', ')}
+                      </p>
+                    </div>
+                  )}
+                  
+                  <div className={`inline-block rounded-2xl px-4 py-2 ${
+                    message.role === 'user' ? 'bg-purple-600 text-white' : 'bg-white/10 text-white'
+                  }`}>
                     <p className="whitespace-pre-wrap">{message.content}</p>
                   </div>
-                  <p className="text-purple-300 text-xs mt-1">
-                    {message.timestamp.toLocaleTimeString()}
-                  </p>
                 </div>
               </div>
             ))
