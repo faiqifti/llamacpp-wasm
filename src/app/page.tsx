@@ -22,6 +22,13 @@ import {
   Brain
 } from 'lucide-react';
 
+// // NEW IMPORTS for pdf.js
+// import * as pdfjsLib from 'pdfjs-dist';
+// import 'pdfjs-dist/build/pdf.worker.entry';
+
+// // This line is crucial for pdf.js to work
+// pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+
 interface ProgressCallback {
   loaded: number;
   total: number;
@@ -106,45 +113,49 @@ class EmbeddingProcessor {
   private wllama: any = null;
   private isInitialized = false;
   private initPromise: Promise<void> | null = null;
+  private useFallback = false;
 
+  // Improved smart mock embedding
+  // In your EmbeddingProcessor, replace generateSmartMockEmbedding:
   private generateSmartMockEmbedding(text: string): number[] {
-    const embedding = new Array(384).fill(0);
-    const words = text.toLowerCase().split(/\s+/);
-    const sentences = text.split(/[.!?]+/);
+    const embeddingSize = 384;
+    const embedding = new Array(embeddingSize).fill(0.001); // Small initial value to avoid zeros
     
-    // Common question words and important terms
-    const questionWords = ['what', 'how', 'why', 'when', 'where', 'who', 'which', 'explain', 'describe', 'show'];
-    const importantVerbs = ['analyze', 'compare', 'calculate', 'find', 'list', 'identify', 'summarize'];
+    const words = text.toLowerCase().split(/\s+/).filter(word => word.length > 1);
     
+    if (words.length === 0) {
+      // Return a very small random embedding for empty text
+      return Array(embeddingSize).fill(0).map(() => Math.random() * 0.01);
+    }
+
     words.forEach(word => {
       const cleanWord = word.replace(/[^a-z0-9]/g, '');
       if (cleanWord.length < 2) return;
       
+      // Simple but deterministic hash
       let hash = 0;
       for (let i = 0; i < cleanWord.length; i++) {
         hash = ((hash << 5) - hash) + cleanWord.charCodeAt(i);
-        hash = hash & hash;
+        hash |= 0; // Convert to 32-bit integer
       }
       
-      // Boost important words
-      let weight = 0.15;
-      if (questionWords.includes(cleanWord)) weight = 0.4;
-      if (importantVerbs.includes(cleanWord)) weight = 0.35;
-      if (cleanWord.length > 6) weight = 0.25; // Longer words often more specific
+      // Normalize weight
+      const weight = 0.1 + (cleanWord.length * 0.05);
       
-      // Distribute across embedding
-      for (let i = 0; i < 4; i++) {
-        const index = Math.abs(hash + i * 7919) % 384;
+      // Distribute across embedding dimensions
+      for (let i = 0; i < 3; i++) {
+        const index = Math.abs((hash + i * 7919) % embeddingSize);
         embedding[index] = (embedding[index] + weight) % 1.0;
       }
     });
-    
-    // Document characteristics
-    embedding[0] = Math.min(words.length / 150, 1.0);
-    embedding[1] = text.includes('?') ? 0.9 : 0.1;
-    embedding[2] = Math.min(sentences.length / 15, 1.0);
-    
-    return embedding;
+
+    // Add some document characteristics
+    embedding[0] = Math.min(words.length / 100, 0.9);
+    embedding[1] = text.includes('?') ? 0.8 : 0.2;
+    embedding[2] = Math.min(text.length / 500, 0.8);
+
+    // Ensure no zeros and normalize a bit
+    return embedding.map(val => Math.max(0.001, val));
   }
 
   async init(): Promise<void> {
@@ -153,6 +164,7 @@ class EmbeddingProcessor {
 
     this.initPromise = (async () => {
       try {
+        console.log('🔄 Initializing embedding model...');
         const WllamaModule = await import('@wllama/wllama/esm/index.js');
         const Wllama = WllamaModule.Wllama;
 
@@ -173,21 +185,22 @@ class EmbeddingProcessor {
           progressCallback: () => {}
         };
 
-        // const embeddingModelUrl = `https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300m-q4_0.gguf`;
+        // Try to load embedding model
         const embeddingModelUrl = `https://huggingface.co/ggml-org/gte-small-Q8_0-GGUF/resolve/main/gte-small-q8_0.gguf`;
         
+        console.log('📥 Loading embedding model from:', embeddingModelUrl);
         await this.wllama.loadModelFromUrl(embeddingModelUrl, config);
         
-        // Enable embeddings for the main instance
+        // Enable embeddings
         await this.wllama.setOptions({ embeddings: true });
 
         this.isInitialized = true;
-        
-        console.log('Embedding model loaded successfully');
+        this.useFallback = false;
+        console.log('✅ Embedding model loaded successfully');
       } catch (error) {
-        console.error('Failed to load embedding model:', error);
-        this.initPromise = null;
-        throw error;
+        console.error('❌ Failed to load embedding model, using fallback:', error);
+        this.useFallback = true;
+        this.isInitialized = true; // Mark as initialized to use fallback
       }
     })();
 
@@ -199,33 +212,22 @@ class EmbeddingProcessor {
       await this.init();
     }
 
+    // If initialization failed or we're using fallback, use mock embeddings
+    if (this.useFallback || !this.wllama) {
+      console.log('🔀 Using fallback embedding for text:', text.substring(0, 50) + '...');
+      return this.generateSmartMockEmbedding(text);
+    }
+
     try {
-      // Note: You might need to adjust this based on the actual Wllama API
-      // Some embedding models might use different methods
+      console.log('🔄 Generating embedding with Wllama...');
       const embedding = await this.wllama.createEmbedding(text);
+      console.log('✅ Embedding generated successfully');
       return embedding;
     } catch (error) {
-      console.error('Embedding generation failed:', error);
-      // Fallback to mock embedding
-      return this.generateMockEmbedding(text);
+      console.error('❌ Wllama embedding failed, using fallback:', error);
+      this.useFallback = true; // Switch to fallback permanently
+      return this.generateSmartMockEmbedding(text);
     }
-  }
-
-  private generateMockEmbedding(text: string): number[] {
-    const embedding = new Array(512).fill(0);
-    const words = text.toLowerCase().split(/\s+/);
-    
-    words.forEach(word => {
-      let hash = 0;
-      for (let i = 0; i < word.length; i++) {
-        hash = ((hash << 5) - hash) + word.charCodeAt(i);
-        hash |= 0;
-      }
-      const index = Math.abs(hash) % 512;
-      embedding[index] = (embedding[index] + 1) % 1.0;
-    });
-    
-    return embedding;
   }
 }
 
@@ -243,11 +245,57 @@ const generateEmbedding = async (text: string): Promise<number[]> => {
 };
 
 const cosineSimilarity = (a: number[], b: number[]): number => {
+  // Check if arrays are valid and same length
+  if (!a || !b || a.length !== b.length || a.length === 0) {
+    return 0;
+  }
+
   const dotProduct = a.reduce((sum, val, i) => sum + val * b[i], 0);
   const magnitudeA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
   const magnitudeB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
-  return dotProduct / (magnitudeA * magnitudeB);
+
+  // Avoid division by zero
+  if (magnitudeA === 0 || magnitudeB === 0) {
+    return 0;
+  }
+
+  const similarity = dotProduct / (magnitudeA * magnitudeB);
+  
+  // Ensure valid number and handle floating point errors
+  if (isNaN(similarity) || !isFinite(similarity)) {
+    return 0;
+  }
+
+  // Clamp between -1 and 1 (theoretical bounds for cosine similarity)
+  return Math.max(-1, Math.min(1, similarity));
 };
+
+// Temporary debug version - add this to see what's wrong
+const debugCosineSimilarity = (a: number[], b: number[]): number => {
+  console.log('🔍 Cosine similarity debug:');
+  console.log('   Vector A length:', a.length, 'Sample:', a.slice(0, 5));
+  console.log('   Vector B length:', b.length, 'Sample:', b.slice(0, 5));
+  
+  const dotProduct = a.reduce((sum, val, i) => sum + val * b[i], 0);
+  const magnitudeA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
+  const magnitudeB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
+  
+  console.log('   Dot product:', dotProduct);
+  console.log('   Magnitude A:', magnitudeA);
+  console.log('   Magnitude B:', magnitudeB);
+  
+  if (magnitudeA === 0 || magnitudeB === 0) {
+    console.log('   ❌ Zero magnitude detected');
+    return 0;
+  }
+  
+  const similarity = dotProduct / (magnitudeA * magnitudeB);
+  console.log('   Similarity:', similarity);
+  
+  return isNaN(similarity) ? 0 : similarity;
+};
+
+// Use this temporarily instead of your cosineSimilarity function
 
 // Update your DocumentProcessor class to use the real embedding model
 // Updated DocumentProcessor class with proper async/await handling
@@ -344,8 +392,45 @@ class DocumentProcessor {
     const documentChunks: DocumentChunk[] = [];
 
     for (let i = 0; i < chunks.length; i++) {
-      try {
-        const embedding = await this.embeddingModel.generateEmbedding(chunks[i]);
+      // try {
+      //   const embedding = await this.embeddingModel.generateEmbedding(chunks[i]);
+      //   documentChunks.push({
+      //     id: `${file.name}-chunk-${i}-${Date.now()}`,
+      //     documentId: file.name,
+      //     content: chunks[i],
+      //     embedding,
+      //     metadata: {
+      //       chunkIndex: i,
+      //       startPos: i * 500,
+      //       endPos: (i * 500) + chunks[i].length
+      //     }
+      //   });
+      // } catch (error) {
+      //   console.error(`Failed to generate embedding for chunk ${i}:`, error);
+      //   // Continue with other chunks even if one fails
+      // }
+      // In your processDocument method, add validation:
+      const embedding = await this.embeddingModel.generateEmbedding(chunks[i]);
+
+      // Validate embedding
+      if (!embedding || !Array.isArray(embedding) || embedding.some(val => isNaN(val))) {
+        console.error(`Invalid embedding generated for chunk ${i}`);
+        // Create a simple fallback embedding
+        const fallbackEmbedding = new Array(384).fill(0).map((_, idx) => 
+          Math.sin(idx + i) * 0.1 + 0.001
+        );
+        documentChunks.push({
+          id: `${file.name}-chunk-${i}-${Date.now()}`,
+          documentId: file.name,
+          content: chunks[i],
+          embedding: fallbackEmbedding,
+          metadata: {
+            chunkIndex: i,
+            startPos: i * 500,
+            endPos: (i * 500) + chunks[i].length
+          }
+        });
+      } else {
         documentChunks.push({
           id: `${file.name}-chunk-${i}-${Date.now()}`,
           documentId: file.name,
@@ -357,9 +442,6 @@ class DocumentProcessor {
             endPos: (i * 500) + chunks[i].length
           }
         });
-      } catch (error) {
-        console.error(`Failed to generate embedding for chunk ${i}:`, error);
-        // Continue with other chunks even if one fails
       }
     }
 
@@ -390,20 +472,20 @@ class DocumentProcessor {
 
   async searchDocuments(query: string, limit: number = 3): Promise<DocumentChunk[]> {
     await this.ensureInitialized();
-
+  
     const queryEmbedding = await this.embeddingModel.generateEmbedding(query);
     const allChunks: DocumentChunk[] = [];
-
+  
     return new Promise((resolve, reject) => {
       if (!this.db) {
         reject(new Error('Database not initialized'));
         return;
       }
-
+  
       const transaction = this.db.transaction([this.STORE_NAME], 'readonly');
       const store = transaction.objectStore(this.STORE_NAME);
       const request = store.getAll();
-
+  
       request.onerror = () => reject(request.error);
       request.onsuccess = () => {
         const documents: StoredDocument[] = request.result;
@@ -411,21 +493,25 @@ class DocumentProcessor {
         documents.forEach(doc => {
           allChunks.push(...doc.chunks);
         });
-
-        // Calculate similarity and filter by threshold
+  
+        // Calculate similarity - LOWER threshold for mock embeddings
         const scoredChunks = allChunks.map(chunk => ({
           chunk,
           score: cosineSimilarity(queryEmbedding, chunk.embedding)
         }));
-
-        // Only return chunks that are actually relevant
+  
+        console.log(`🔍 Search results - Query: "${query}"`);
+        console.log(`   Total chunks: ${allChunks.length}`);
+        console.log(`   Similarity scores:`, scoredChunks.map(s => s.score.toFixed(3)));
+  
+        // Lower threshold for mock embeddings since they're less accurate
         const relevantChunks = scoredChunks
-          .filter(item => item.score > 0.3) // Minimum similarity threshold
+          .filter(item => item.score > 0.1) // Lower threshold from 0.3 to 0.1
           .sort((a, b) => b.score - a.score)
           .slice(0, limit)
           .map(item => item.chunk);
-
-        console.log(`Found ${relevantChunks.length} relevant chunks for: "${query}"`);
+  
+        console.log(`✅ Found ${relevantChunks.length} relevant chunks`);
         resolve(relevantChunks);
       };
     });
@@ -593,6 +679,20 @@ export default function WllamaUI() {
 
   const [documentProcessor] = useState(new DocumentProcessor());
   const [processedDocuments, setProcessedDocuments] = useState<StoredDocument[]>([]);
+
+  // Add these to your existing useState declarations
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
+  const [showDebug, setShowDebug] = useState(false);
+
+  // Add this helper function
+  const addDebugLog = (message: string) => {
+    console.log(message);
+    setDebugLogs(prev => {
+      const newLogs = [...prev, `${new Date().toLocaleTimeString()}: ${message}`];
+      // Keep only last 50 logs to prevent memory issues
+      return newLogs.slice(-50);
+    });
+  };
 
   // Initialize document processor
   // In your WllamaUI component, replace the problematic useEffect with:
@@ -896,6 +996,67 @@ export default function WllamaUI() {
       }
     });
   };
+
+  // Replace the old function with this one
+  // const extractTextFromFile = async (file: File): Promise<string> => {
+  //   return new Promise((resolve, reject) => {
+  //     const fileType = file.type.toLowerCase();
+  //     const fileName = file.name.toLowerCase();
+  //     const reader = new FileReader();
+
+  //     // --- For CSV and TXT files (Reliable method) ---
+  //     if (fileType.includes('csv') || fileType.includes('text/plain') || fileName.endsWith('.txt')) {
+  //       reader.onload = (e) => {
+  //         const content = e.target?.result as string || '';
+  //         // Ensure your CSV file is saved with UTF-8 encoding for best results
+  //         const cleanedContent = content.split('\n')
+  //           .map(line => line.trim())
+  //           .filter(line => line.length > 0)
+  //           .join('\n');
+  //         resolve(cleanedContent);
+  //       };
+  //       reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+  //       reader.readAsText(file); // Reads as text, assuming UTF-8
+  //     }
+  //     // --- For PDF files (NEW robust method using pdf.js) ---
+  //     else if (fileType.includes('pdf') || fileName.endsWith('.pdf')) {
+  //       reader.onload = async (e) => {
+  //         try {
+  //           const arrayBuffer = e.target?.result as ArrayBuffer;
+  //           if (!arrayBuffer) {
+  //             return reject(new Error('Could not read PDF file buffer.'));
+  //           }
+            
+  //           const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+  //           let fullText = '';
+            
+  //           for (let i = 1; i <= pdf.numPages; i++) {
+  //             const page = await pdf.getPage(i);
+  //             const textContent = await page.getTextContent();
+  //             const pageText = textContent.items.map(item => ('str' in item ? item.str : '')).join(' ');
+  //             fullText += pageText + '\n\n'; // Add text from page
+  //           }
+            
+  //           resolve(fullText.trim());
+
+  //         } catch (err: any) {
+  //           console.error('PDF extraction error:', err);
+  //           reject(new Error(`Failed to extract text from PDF: ${err.message || 'Unknown error'}`));
+  //         }
+  //       };
+  //       reader.onerror = () => reject(new Error(`Failed to read PDF file ${file.name}`));
+  //       reader.readAsArrayBuffer(file); // pdf.js works with an ArrayBuffer
+  //     }
+  //     // --- For DOC/DOCX files (Known limitation) ---
+  //     else if (fileType.includes('msword') || fileType.includes('wordprocessingml') || 
+  //             fileName.endsWith('.doc') || fileName.endsWith('.docx')) {
+  //       resolve(`Word Document: ${file.name}\n\n[INFO] DOC/DOCX text extraction is not supported in this app. Please convert the file to PDF or TXT format and upload again for it to be processed.`);
+  //     }
+  //     else {
+  //       resolve(`[ERROR] Unsupported file type: ${file.name}. Please use PDF, CSV, or TXT files.`);
+  //     }
+  //   });
+  // };
 
   // Process all attached files and extract text
   const processAttachedFiles = async (): Promise<Attachment[]> => {
@@ -1279,6 +1440,114 @@ export default function WllamaUI() {
     return prompt;
   };
 
+  // const sendMessage = async () => {
+  //   if (!wllamaRef.current) {
+  //     setError('Please load a model first');
+  //     return;
+  //   }
+  
+  //   if (!input.trim() && attachedFiles.length === 0) {
+  //     setError('Please enter a message or attach files');
+  //     return;
+  //   }
+  
+  //   if (!currentConversationId) {
+  //     createNewConversation();
+  //     return;
+  //   }
+  
+  //   const userMessage = input.trim() || 
+  //     (attachedFiles.length > 0 
+  //       ? `Please analyze the content of the attached file${attachedFiles.length > 1 ? 's' : ''} and provide a summary or answer questions about it.` 
+  //       : '');
+    
+  //   setInput('');
+  //   setIsGenerating(true);
+  //   setError('');
+  
+  //   // Process attachments first
+  //   const attachments = await processAttachedFiles();
+  
+  //   const newUserMessage: Message = {
+  //     role: 'user',
+  //     content: userMessage,
+  //     timestamp: new Date(),
+  //     attachments: attachments.length > 0 ? attachments : undefined
+  //   };
+  
+  //   // Add user message first
+  //   setConversations(prev => prev.map(conv => {
+  //     if (conv.id === currentConversationId) {
+  //       const updatedMessages = [...conv.messages, newUserMessage];
+  //       return {
+  //         ...conv,
+  //         messages: updatedMessages,
+  //         updatedAt: new Date()
+  //       };
+  //     }
+  //     return conv;
+  //   }));
+  
+  //   if (messages.length === 0) {
+  //     updateConversationTitle(currentConversationId, userMessage || `Chat with ${attachments.length} file${attachments.length > 1 ? 's' : ''}`);
+  //   }
+  
+  //   // Clear attached files after processing
+  //   setAttachedFiles([]);
+  
+  //   // SINGLE TRY BLOCK - removed the nested one
+  //   try {
+  //     // Use the current messages (including the one we just added)
+  //     const currentConv = conversations.find(c => c.id === currentConversationId);
+  //     const messagesForPrompt = currentConv ? [...currentConv.messages, newUserMessage] : [newUserMessage];
+      
+  //     // SEARCH DOCUMENTS FIRST - moved here
+  //     let documentSources: string[] = [];
+  //     let formattedPrompt = '';
+      
+  //     if (processedDocuments.length > 0) {
+  //       const relevantChunks = await documentProcessor.searchDocuments(userMessage, 3);
+  //       if (relevantChunks.length > 0) {
+  //         // documentSources = [...new Set(relevantChunks.map(chunk => chunk.documentId))];
+  //         documentSources = relevantChunks.map(chunk => chunk.documentId);
+  //       }
+  //     }
+      
+  //     formattedPrompt = await buildConversationPrompt(
+  //       messagesForPrompt.slice(0, -1),
+  //       userMessage, 
+  //       attachments
+  //     );
+  
+  //     // Get the index for the assistant's message
+  //     const assistantMessageIndex = messages.length + 1;
+  
+  //     // Add placeholder for assistant response WITH documentSources
+  //     setConversations(prev => prev.map(conv => {
+  //       if (conv.id === currentConversationId) {
+  //         return {
+  //           ...conv,
+  //           messages: [...conv.messages, {
+  //             role: 'assistant',
+  //             content: '',
+  //             timestamp: new Date(),
+  //             documentSources: documentSources.length > 0 ? documentSources : undefined // Add here
+  //           }],
+  //           updatedAt: new Date()
+  //         };
+  //       }
+  //       return conv;
+  //     }));
+  
+  //   } catch (err: any) {
+  //     setError('Failed to generate response: ' + (err?.message || String(err)));
+  //     console.error('Generation error:', err);
+  //   } finally {
+  //     setIsGenerating(false);
+  //     inputRef.current?.focus();
+  //   }
+  // };
+
   const sendMessage = async () => {
     if (!wllamaRef.current) {
       setError('Please load a model first');
@@ -1334,34 +1603,53 @@ export default function WllamaUI() {
     // Clear attached files after processing
     setAttachedFiles([]);
   
-    // SINGLE TRY BLOCK - removed the nested one
     try {
-      // Use the current messages (including the one we just added)
+      // ✅ ADD DOCUMENT SEARCH HERE
+      let documentSources: string[] = [];
+      
+      addDebugLog(`📚 Checking processed documents: ${processedDocuments.length}`);
+      
+      // Only search if we have processed documents
+      if (processedDocuments.length > 0 && userMessage.trim()) {
+        try {
+          addDebugLog(`🔍 Searching documents for: "${userMessage}"`);
+          const relevantChunks = await documentProcessor.searchDocuments(userMessage, 3);
+          addDebugLog(`📄 Found ${relevantChunks.length} relevant chunks`);
+          
+          if (relevantChunks.length > 0) {
+            // Get unique document names
+            // documentSources = [...new Set(relevantChunks.map(chunk => chunk.documentId))];
+            documentSources = relevantChunks.map(chunk => chunk.documentId);
+            addDebugLog(`📋 Document sources: ${documentSources.join(', ')}`);
+            
+            // Log some chunk content for debugging
+            relevantChunks.slice(0, 2).forEach((chunk, index) => {
+              addDebugLog(`   Chunk ${index + 1}: ${chunk.content.substring(0, 100)}...`);
+            });
+          } else {
+            addDebugLog('❌ No relevant chunks found for this query');
+          }
+        } catch (searchError) {
+          addDebugLog(`❌ Document search error: ${searchError}`);
+          console.error('Document search failed:', searchError);
+        }
+      } else {
+        addDebugLog(`ℹ️ No documents to search or empty query. Documents: ${processedDocuments.length}, Query: "${userMessage}"`);
+      }
+  
+      // Build the prompt
       const currentConv = conversations.find(c => c.id === currentConversationId);
       const messagesForPrompt = currentConv ? [...currentConv.messages, newUserMessage] : [newUserMessage];
       
-      // SEARCH DOCUMENTS FIRST - moved here
-      let documentSources: string[] = [];
-      let formattedPrompt = '';
-      
-      if (processedDocuments.length > 0) {
-        const relevantChunks = await documentProcessor.searchDocuments(userMessage, 3);
-        if (relevantChunks.length > 0) {
-          // documentSources = [...new Set(relevantChunks.map(chunk => chunk.documentId))];
-          documentSources = relevantChunks.map(chunk => chunk.documentId);
-        }
-      }
-      
-      formattedPrompt = await buildConversationPrompt(
+      const formattedPrompt = await buildConversationPrompt(
         messagesForPrompt.slice(0, -1),
         userMessage, 
         attachments
       );
   
-      // Get the index for the assistant's message
-      const assistantMessageIndex = messages.length + 1;
+      addDebugLog(`🤖 Adding assistant message with sources: ${documentSources.length > 0 ? documentSources.join(', ') : 'none'}`);
   
-      // Add placeholder for assistant response WITH documentSources
+      // Add empty assistant message with document sources
       setConversations(prev => prev.map(conv => {
         if (conv.id === currentConversationId) {
           return {
@@ -1370,8 +1658,43 @@ export default function WllamaUI() {
               role: 'assistant',
               content: '',
               timestamp: new Date(),
-              documentSources: documentSources.length > 0 ? documentSources : undefined // Add here
+              documentSources: documentSources.length > 0 ? documentSources : undefined
             }],
+            updatedAt: new Date()
+          };
+        }
+        return conv;
+      }));
+  
+      // Generate response
+      const response = await wllamaRef.current.createCompletion(formattedPrompt, {
+        n_predict: 2048,
+        temperature: 0.7,
+        top_k: 40,
+        top_p: 0.9,
+        repeat_penalty: 1.1,
+        stop: ['<end_of_turn>', '<|im_end|>', '</s>', '[INST]'],
+        stream: false
+      });
+  
+      // Get the response text
+      const fullResponse = String(response).trim();
+      addDebugLog(`💬 Model response: ${fullResponse.substring(0, 100)}...`);
+  
+      // Update the assistant message with the response
+      setConversations(prev => prev.map(conv => {
+        if (conv.id === currentConversationId && conv.messages.length > 0) {
+          const updatedMessages = [...conv.messages];
+          const lastMessageIndex = updatedMessages.length - 1;
+          if (updatedMessages[lastMessageIndex].role === 'assistant') {
+            updatedMessages[lastMessageIndex] = {
+              ...updatedMessages[lastMessageIndex],
+              content: fullResponse
+            };
+          }
+          return {
+            ...conv,
+            messages: updatedMessages,
             updatedAt: new Date()
           };
         }
@@ -1381,6 +1704,20 @@ export default function WllamaUI() {
     } catch (err: any) {
       setError('Failed to generate response: ' + (err?.message || String(err)));
       console.error('Generation error:', err);
+      addDebugLog(`💥 Generation error: ${err.message}`);
+      
+      // Remove the empty assistant message if generation failed
+      setConversations(prev => prev.map(conv => {
+        if (conv.id === currentConversationId) {
+          return {
+            ...conv,
+            messages: conv.messages.filter((msg, index) => 
+              !(msg.role === 'assistant' && msg.content === '' && index === conv.messages.length - 1)
+            )
+          };
+        }
+        return conv;
+      }));
     } finally {
       setIsGenerating(false);
       inputRef.current?.focus();
@@ -1809,12 +2146,26 @@ export default function WllamaUI() {
                   )}
                 </div>
                 <div className={`flex-1 max-w-3xl ${message.role === 'user' ? 'text-right' : 'text-left'}`}>
-                  {/* Show document sources for assistant messages */}
-                  {message.role === 'assistant' && message.documentSources && (
-                    <div className="mb-2 p-2 bg-green-500/20 border border-green-500/30 rounded-lg">
-                      <p className="text-green-300 text-xs">
-                        📚 Based on: {message.documentSources.join(', ')}
-                      </p>
+                  
+                  {/* ✅ FIXED: Document sources display - check if array exists and has items */}
+                  {message.role === 'assistant' && message.documentSources && message.documentSources.length > 0 && (
+                    <div className="mb-2 p-3 bg-green-500/20 border border-green-500/30 rounded-lg">
+                      <div className="flex items-center gap-2 text-green-300 text-sm">
+                        <FileText className="w-4 h-4 flex-shrink-0" />
+                        <div>
+                          <span className="font-semibold">Based on documents:</span>
+                          <div className="flex flex-wrap gap-1 mt-1">
+                            {message.documentSources.map((source, idx) => (
+                              <span 
+                                key={idx} 
+                                className="bg-green-500/30 px-2 py-1 rounded text-xs"
+                              >
+                                {source}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   )}
                   
@@ -1823,6 +2174,13 @@ export default function WllamaUI() {
                   }`}>
                     <p className="whitespace-pre-wrap">{message.content}</p>
                   </div>
+                  
+                  {/* Debug info - remove this in production */}
+                  {message.role === 'assistant' && (
+                    <div className="mt-1 text-xs text-gray-400">
+                      Sources: {message.documentSources ? JSON.stringify(message.documentSources) : 'none'}
+                    </div>
+                  )}
                 </div>
               </div>
             ))
@@ -1878,6 +2236,18 @@ export default function WllamaUI() {
               title="Attach PDF, CSV, DOC, DOCX, or TXT files"
             >
               <FileText className="w-5 h-5" />
+            </button>
+
+            {/* Add this button somewhere in your UI for testing  */}
+            <button
+              onClick={() => {
+                console.log('📊 Processed documents:', processedDocuments);
+                console.log('💬 Current messages:', messages);
+                console.log('🔍 Last assistant message:', messages.find(m => m.role === 'assistant'));
+              }}
+              className="bg-blue-600 text-white p-2 rounded"
+            >
+              Debug State
             </button>
 
             {/* Chat Template Selector */}
